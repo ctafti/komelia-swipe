@@ -1,5 +1,5 @@
 diff --git a/komelia-app/androidApp/src/main/kotlin/snd/komelia/MainActivity.kt b/komelia-app/androidApp/src/main/kotlin/snd/komelia/MainActivity.kt
-index 91df128c..982cf9cb 100644
+index 91df128c..f89589a3 100644
 --- a/komelia-app/androidApp/src/main/kotlin/snd/komelia/MainActivity.kt
 +++ b/komelia-app/androidApp/src/main/kotlin/snd/komelia/MainActivity.kt
 @@ -4,15 +4,17 @@ import android.app.Activity
@@ -46,40 +46,164 @@ index 91df128c..982cf9cb 100644
 +                )
 +            }
          }
-+        // Wrapped so readers can hide the mouse pointer (see PointerVisibilityLayout)
++        // Wrapped for app-wide pointer handling (see PointerInputRootLayout)
 +        setContentView(
-+            PointerVisibilityLayout(this).apply {
++            PointerInputRootLayout(this).apply {
 +                addView(composeView, ViewGroup.LayoutParams(MATCH_PARENT, MATCH_PARENT))
 +            }
 +        )
      }
  }
  
-diff --git a/komelia-app/androidApp/src/main/kotlin/snd/komelia/PointerVisibilityLayout.kt b/komelia-app/androidApp/src/main/kotlin/snd/komelia/PointerVisibilityLayout.kt
+diff --git a/komelia-app/androidApp/src/main/kotlin/snd/komelia/PointerInputRootLayout.kt b/komelia-app/androidApp/src/main/kotlin/snd/komelia/PointerInputRootLayout.kt
 new file mode 100644
-index 00000000..92bcafc2
+index 00000000..695d240f
 --- /dev/null
-+++ b/komelia-app/androidApp/src/main/kotlin/snd/komelia/PointerVisibilityLayout.kt
-@@ -0,0 +1,21 @@
++++ b/komelia-app/androidApp/src/main/kotlin/snd/komelia/PointerInputRootLayout.kt
+@@ -0,0 +1,145 @@
 +package snd.komelia
 +
 +import android.content.Context
++import android.view.InputDevice
 +import android.view.MotionEvent
 +import android.view.PointerIcon
 +import android.widget.FrameLayout
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.MainScope
++import kotlinx.coroutines.cancel
++import kotlinx.coroutines.launch
++import snd.komelia.ui.platform.CapturedPointerGesture
++import snd.komelia.ui.platform.CapturedPointerInput
 +import snd.komelia.ui.platform.PointerVisibility
 +
 +/**
-+ * Root layout that hides the mouse pointer while [PointerVisibility.isHidden].
++ * Root layout of the activity that implements app-wide pointer handling:
 + *
-+ * Android asks the view hierarchy for the pointer icon from the root down. Answering here, above
-+ * Compose, keeps the pointer hidden even when Compose updates its own icon (which it does on every
-+ * press) and over embedded views such as the EPUB reader's WebView.
++ * - Hides the mouse pointer while [PointerVisibility.isHidden]. Android asks the view hierarchy for
++ *   the pointer icon from the root down, so answering here keeps the pointer hidden even when Compose
++ *   updates its own icon (which it does on every press), and over embedded views such as the EPUB
++ *   reader's WebView.
++ * - Provides [CapturedPointerInput]: while a screen listens, it requests pointer capture, so mouse- and
++ *   touchpad-like devices (e.g. Bluetooth page-turner remotes that move a cursor) send their input to
++ *   the app instead of moving the cursor and touching the screen. Captured events are delivered
++ *   through the focused view chain, so they are intercepted here before reaching Compose or a WebView.
 + */
-+class PointerVisibilityLayout(context: Context) : FrameLayout(context) {
++class PointerInputRootLayout(context: Context) : FrameLayout(context) {
++    private val gestureTracker = CapturedGestureTracker(CapturedPointerInput::dispatch)
++    private var scope: CoroutineScope? = null
++
++    override fun onAttachedToWindow() {
++        super.onAttachedToWindow()
++        scope = MainScope().also { scope ->
++            scope.launch { CapturedPointerInput.isActive.collect { updatePointerCapture() } }
++        }
++    }
++
++    override fun onDetachedFromWindow() {
++        scope?.cancel()
++        scope = null
++        super.onDetachedFromWindow()
++    }
++
++    override fun onWindowFocusChanged(hasWindowFocus: Boolean) {
++        super.onWindowFocusChanged(hasWindowFocus)
++        // Android releases pointer capture when the window loses focus
++        updatePointerCapture()
++    }
++
++    private fun updatePointerCapture() {
++        val requested = CapturedPointerInput.isActive.value
++        if (requested && hasWindowFocus() && !hasPointerCapture()) {
++            // Captured events are dispatched along the focused view chain
++            if (findFocus() == null) requestFocus()
++            requestPointerCapture()
++        } else if (!requested && hasPointerCapture()) {
++            releasePointerCapture()
++        }
++    }
++
++    override fun dispatchCapturedPointerEvent(event: MotionEvent): Boolean {
++        if (!CapturedPointerInput.isActive.value) return super.dispatchCapturedPointerEvent(event)
++        gestureTracker.onEvent(event)
++        return true
++    }
++
 +    override fun onResolvePointerIcon(event: MotionEvent, pointerIndex: Int): PointerIcon? {
 +        return if (PointerVisibility.isHidden) PointerIcon.getSystemIcon(context, PointerIcon.TYPE_NULL)
 +        else super.onResolvePointerIcon(event, pointerIndex)
++    }
++}
++
++/**
++ * Turns captured pointer events into presses: the movement between press and release.
++ *
++ * Mice are captured as [InputDevice.SOURCE_MOUSE_RELATIVE] and report movement deltas, which are summed.
++ * Touchpad-like devices report absolute positions on the pad, converted to thousandths of the pad size.
++ */
++private class CapturedGestureTracker(private val onGesture: (CapturedPointerGesture) -> Unit) {
++    private var pressed = false
++    private var relativeX = 0f
++    private var relativeY = 0f
++    private var startX = 0f
++    private var startY = 0f
++    private var endX = 0f
++    private var endY = 0f
++
++    fun onEvent(event: MotionEvent) {
++        val relative = event.isFromSource(InputDevice.SOURCE_MOUSE_RELATIVE)
++        when (event.actionMasked) {
++            MotionEvent.ACTION_DOWN -> {
++                pressed = true
++                relativeX = 0f
++                relativeY = 0f
++                startX = event.x
++                startY = event.y
++                endX = event.x
++                endY = event.y
++                if (relative) addRelativeMovement(event)
++            }
++
++            MotionEvent.ACTION_MOVE -> if (pressed) {
++                if (relative) addRelativeMovement(event)
++                else {
++                    endX = event.x
++                    endY = event.y
++                }
++            }
++
++            MotionEvent.ACTION_UP -> if (pressed) {
++                pressed = false
++                if (relative) {
++                    addRelativeMovement(event)
++                    onGesture(CapturedPointerGesture(relativeX, relativeY))
++                } else {
++                    endX = event.x
++                    endY = event.y
++                    onGesture(
++                        CapturedPointerGesture(
++                            deltaX = (endX - startX) * 1000f / axisRange(event, MotionEvent.AXIS_X),
++                            deltaY = (endY - startY) * 1000f / axisRange(event, MotionEvent.AXIS_Y),
++                        )
++                    )
++                }
++            }
++
++            MotionEvent.ACTION_CANCEL -> pressed = false
++        }
++    }
++
++    private fun addRelativeMovement(event: MotionEvent) {
++        for (i in 0 until event.historySize) {
++            relativeX += event.getHistoricalX(i)
++            relativeY += event.getHistoricalY(i)
++        }
++        relativeX += event.x
++        relativeY += event.y
++    }
++
++    private fun axisRange(event: MotionEvent, axis: Int): Float {
++        val range = event.device?.getMotionRange(axis, event.source)?.range
++        return if (range == null || range <= 0f) 1000f else range
 +    }
 +}
 diff --git a/komelia-domain/core/src/commonMain/kotlin/snd/komelia/settings/ImageReaderSettingsRepository.kt b/komelia-domain/core/src/commonMain/kotlin/snd/komelia/settings/ImageReaderSettingsRepository.kt
@@ -226,12 +350,12 @@ index 404a46bb..cf9de1a2 100644
    fullscreenIsAvailable.value = await externalFunctions.isFullscreenAvailable()
 diff --git a/komelia-epub-reader/komga-webui/src/komelia-navigation.ts b/komelia-epub-reader/komga-webui/src/komelia-navigation.ts
 new file mode 100644
-index 00000000..bb888aee
+index 00000000..33a737c8
 --- /dev/null
 +++ b/komelia-epub-reader/komga-webui/src/komelia-navigation.ts
-@@ -0,0 +1,71 @@
+@@ -0,0 +1,72 @@
 +/**
-+ * Connects this reader to Komelia's swipe navigation and learned remote buttons.
++ * Connects this reader to Komelia's swipe navigation and remote buttons.
 + *
 + * Komelia binds two functions on `window` (see EpubNavigationBridge.kt):
 + * - `komeliaAwaitPageTurn()` resolves with "next" or "previous" when Komelia wants to turn the page,
@@ -241,8 +365,9 @@ index 00000000..bb888aee
 + */
 +
 +export interface KomeliaPageTurner {
-+  nextPage(): void
-+  previousPage(): void
++    nextPage(): void
++
++    previousPage(): void
 +}
 +
 +export type KomeliaScrollAxis = 'vertical' | 'horizontal' | 'none'
@@ -251,30 +376,30 @@ index 00000000..bb888aee
 + * Turns pages whenever Komelia asks. Returns a function that stops listening.
 + */
 +export function startKomeliaPageTurns(getPageTurner: () => KomeliaPageTurner | undefined): () => void {
-+  let active = true
-+  const listen = async () => {
-+    const w = window as any
-+    while (active) {
-+      if (typeof w.komeliaAwaitPageTurn !== 'function') {
-+        await delay(500)
-+        continue
-+      }
-+      let action: string | undefined
-+      try {
-+        action = (await w.komeliaAwaitPageTurn())?.result
-+      } catch (e) {
-+        return
-+      }
-+      if (!active || action === 'closed') return
-+      const pageTurner = getPageTurner()
-+      if (action === 'next') pageTurner?.nextPage()
-+      else if (action === 'previous') pageTurner?.previousPage()
++    let active = true
++    const listen = async () => {
++        const w = window as any
++        while (active) {
++            if (typeof w.komeliaAwaitPageTurn !== 'function') {
++                await delay(500)
++                continue
++            }
++            let action: string | undefined
++            try {
++                action = (await w.komeliaAwaitPageTurn())?.result
++            } catch (e) {
++                return
++            }
++            if (!active || action === 'closed') return
++            const pageTurner = getPageTurner()
++            if (action === 'next') pageTurner?.nextPage()
++            else if (action === 'previous') pageTurner?.previousPage()
++        }
 +    }
-+  }
-+  listen()
-+  return () => {
-+    active = false
-+  }
++    listen()
++    return () => {
++        active = false
++    }
 +}
 +
 +let latestScrollAxis: KomeliaScrollAxis = 'none'
@@ -284,22 +409,22 @@ index 00000000..bb888aee
 + * Tells Komelia which way the reader scrolls. Retries until Komelia's functions are available.
 + */
 +export function reportKomeliaScrollAxis(axis: KomeliaScrollAxis) {
-+  latestScrollAxis = axis
-+  const w = window as any
-+  if (typeof w.komeliaSetScrollAxis === 'function') {
-+    Promise.resolve(w.komeliaSetScrollAxis(axis)).catch(() => {})
-+    return
-+  }
-+  if (scrollAxisReportPending) return
-+  scrollAxisReportPending = true
-+  setTimeout(() => {
-+    scrollAxisReportPending = false
-+    reportKomeliaScrollAxis(latestScrollAxis)
-+  }, 500)
++    latestScrollAxis = axis
++    const w = window as any
++    if (typeof w.komeliaSetScrollAxis === 'function') {
++        Promise.resolve(w.komeliaSetScrollAxis(axis)).catch(() => {})
++        return
++    }
++    if (scrollAxisReportPending) return
++    scrollAxisReportPending = true
++    setTimeout(() => {
++        scrollAxisReportPending = false
++        reportKomeliaScrollAxis(latestScrollAxis)
++    }, 500)
 +}
 +
 +function delay(ms: number) {
-+  return new Promise(resolve => setTimeout(resolve, ms))
++    return new Promise(resolve => setTimeout(resolve, ms))
 +}
 diff --git a/komelia-epub-reader/ttu-ebook-reader/src/lib/components/Reader.svelte b/komelia-epub-reader/ttu-ebook-reader/src/lib/components/Reader.svelte
 index ebcb96df..fdf70b3e 100644
@@ -343,12 +468,12 @@ index ebcb96df..fdf70b3e 100644
      readerImageGalleryPictures$.next([]);
 diff --git a/komelia-epub-reader/ttu-ebook-reader/src/lib/komelia-navigation.ts b/komelia-epub-reader/ttu-ebook-reader/src/lib/komelia-navigation.ts
 new file mode 100644
-index 00000000..bb888aee
+index 00000000..59f534bd
 --- /dev/null
 +++ b/komelia-epub-reader/ttu-ebook-reader/src/lib/komelia-navigation.ts
-@@ -0,0 +1,71 @@
+@@ -0,0 +1,72 @@
 +/**
-+ * Connects this reader to Komelia's swipe navigation and learned remote buttons.
++ * Connects this reader to Komelia's swipe navigation and remote buttons.
 + *
 + * Komelia binds two functions on `window` (see EpubNavigationBridge.kt):
 + * - `komeliaAwaitPageTurn()` resolves with "next" or "previous" when Komelia wants to turn the page,
@@ -358,65 +483,66 @@ index 00000000..bb888aee
 + */
 +
 +export interface KomeliaPageTurner {
-+  nextPage(): void
-+  previousPage(): void
++  nextPage(): void;
++
++  previousPage(): void;
 +}
 +
-+export type KomeliaScrollAxis = 'vertical' | 'horizontal' | 'none'
++export type KomeliaScrollAxis = 'vertical' | 'horizontal' | 'none';
 +
 +/**
 + * Turns pages whenever Komelia asks. Returns a function that stops listening.
 + */
 +export function startKomeliaPageTurns(getPageTurner: () => KomeliaPageTurner | undefined): () => void {
-+  let active = true
++  let active = true;
 +  const listen = async () => {
-+    const w = window as any
++    const w = window as any;
 +    while (active) {
 +      if (typeof w.komeliaAwaitPageTurn !== 'function') {
-+        await delay(500)
-+        continue
++        await delay(500);
++        continue;
 +      }
-+      let action: string | undefined
++      let action: string | undefined;
 +      try {
-+        action = (await w.komeliaAwaitPageTurn())?.result
++        action = (await w.komeliaAwaitPageTurn())?.result;
 +      } catch (e) {
-+        return
++        return;
 +      }
-+      if (!active || action === 'closed') return
-+      const pageTurner = getPageTurner()
-+      if (action === 'next') pageTurner?.nextPage()
-+      else if (action === 'previous') pageTurner?.previousPage()
++      if (!active || action === 'closed') return;
++      const pageTurner = getPageTurner();
++      if (action === 'next') pageTurner?.nextPage();
++      else if (action === 'previous') pageTurner?.previousPage();
 +    }
-+  }
-+  listen()
++  };
++  listen();
 +  return () => {
-+    active = false
-+  }
++    active = false;
++  };
 +}
 +
-+let latestScrollAxis: KomeliaScrollAxis = 'none'
-+let scrollAxisReportPending = false
++let latestScrollAxis: KomeliaScrollAxis = 'none';
++let scrollAxisReportPending = false;
 +
 +/**
 + * Tells Komelia which way the reader scrolls. Retries until Komelia's functions are available.
 + */
 +export function reportKomeliaScrollAxis(axis: KomeliaScrollAxis) {
-+  latestScrollAxis = axis
-+  const w = window as any
++  latestScrollAxis = axis;
++  const w = window as any;
 +  if (typeof w.komeliaSetScrollAxis === 'function') {
-+    Promise.resolve(w.komeliaSetScrollAxis(axis)).catch(() => {})
-+    return
++    Promise.resolve(w.komeliaSetScrollAxis(axis)).catch(() => {});
++    return;
 +  }
-+  if (scrollAxisReportPending) return
-+  scrollAxisReportPending = true
++  if (scrollAxisReportPending) return;
++  scrollAxisReportPending = true;
 +  setTimeout(() => {
-+    scrollAxisReportPending = false
-+    reportKomeliaScrollAxis(latestScrollAxis)
-+  }, 500)
++    scrollAxisReportPending = false;
++    reportKomeliaScrollAxis(latestScrollAxis);
++  }, 500);
 +}
 +
 +function delay(ms: number) {
-+  return new Promise(resolve => setTimeout(resolve, ms))
++  return new Promise((resolve) => setTimeout(resolve, ms));
 +}
 diff --git a/komelia-infra/database/shared/src/commonMain/kotlin/snd/komelia/db/ImageReaderSettings.kt b/komelia-infra/database/shared/src/commonMain/kotlin/snd/komelia/db/ImageReaderSettings.kt
 index 8b279773..33aa34b6 100644
@@ -489,7 +615,7 @@ index 18b633b1..a78fbd7e 100644
  
      override suspend fun getMigration(name: String): ByteArray? {
 diff --git a/komelia-infra/database/sqlite/src/commonMain/kotlin/snd/komelia/db/settings/ExposedImageReaderSettingsRepository.kt b/komelia-infra/database/sqlite/src/commonMain/kotlin/snd/komelia/db/settings/ExposedImageReaderSettingsRepository.kt
-index 1049c787..cd497a9a 100644
+index 1049c787..604a6869 100644
 --- a/komelia-infra/database/sqlite/src/commonMain/kotlin/snd/komelia/db/settings/ExposedImageReaderSettingsRepository.kt
 +++ b/komelia-infra/database/sqlite/src/commonMain/kotlin/snd/komelia/db/settings/ExposedImageReaderSettingsRepository.kt
 @@ -2,6 +2,8 @@ package snd.komelia.db.settings
@@ -514,7 +640,7 @@ index 1049c787..cd497a9a 100644
  import snd.komelia.settings.model.ReaderType
  
  class ExposedImageReaderSettingsRepository(database: Database) : ExposedRepository(database) {
-@@ -48,6 +53,13 @@ class ExposedImageReaderSettingsRepository(database: Database) : ExposedReposito
+@@ -48,6 +53,15 @@ class ExposedImageReaderSettingsRepository(database: Database) : ExposedReposito
                          upsamplingMode = UpsamplingMode.valueOf(it[ImageReaderSettingsTable.upsamplingMode]),
                          loadThumbnailPreviews = it[ImageReaderSettingsTable.loadThumbnailPreviews],
                          volumeKeysNavigation = it[ImageReaderSettingsTable.volumeKeysNavigation],
@@ -523,12 +649,14 @@ index 1049c787..cd497a9a 100644
 +                            swipeRight = ReaderSwipeAction.valueOf(it[ImageReaderSettingsTable.swipeRight]),
 +                            swipeUp = ReaderSwipeAction.valueOf(it[ImageReaderSettingsTable.swipeUp]),
 +                            swipeDown = ReaderSwipeAction.valueOf(it[ImageReaderSettingsTable.swipeDown]),
-+                            learnedRemoteButtons = decodeRemoteButtons(it[ImageReaderSettingsTable.learnedRemoteButtons]),
++                            learnedRemoteButtons = decodeRemoteButtons(
++                                it[ImageReaderSettingsTable.learnedRemoteButtons]
++                            ),
 +                        ),
                          ortUpscalerMode = UpscaleMode.valueOf(it[ImageReaderSettingsTable.ortUpscalerMode]),
                          ortUpscalerUserModelPath = it[ImageReaderSettingsTable.ortUpscalerUserModelPath]
                              ?.let { PlatformFile(it) },
-@@ -79,6 +91,11 @@ class ExposedImageReaderSettingsRepository(database: Database) : ExposedReposito
+@@ -79,6 +93,14 @@ class ExposedImageReaderSettingsRepository(database: Database) : ExposedReposito
                  it[linearLightDownsampling] = settings.linearLightDownsampling
                  it[loadThumbnailPreviews] = settings.loadThumbnailPreviews
                  it[volumeKeysNavigation] = settings.volumeKeysNavigation
@@ -536,11 +664,14 @@ index 1049c787..cd497a9a 100644
 +                it[swipeRight] = settings.swipeActions.swipeRight.name
 +                it[swipeUp] = settings.swipeActions.swipeUp.name
 +                it[swipeDown] = settings.swipeActions.swipeDown.name
-+                it[learnedRemoteButtons] = json.encodeToString(remoteButtonsSerializer, settings.swipeActions.learnedRemoteButtons)
++                it[learnedRemoteButtons] = json.encodeToString(
++                    remoteButtonsSerializer,
++                    settings.swipeActions.learnedRemoteButtons
++                )
                  it[upsamplingMode] = settings.upsamplingMode.name
                  it[ortUpscalerMode] = settings.ortUpscalerMode.name
                  it[ortUpscalerUserModelPath] = settings.ortUpscalerUserModelPath?.path
-@@ -87,4 +104,11 @@ class ExposedImageReaderSettingsRepository(database: Database) : ExposedReposito
+@@ -87,4 +109,11 @@ class ExposedImageReaderSettingsRepository(database: Database) : ExposedReposito
              }
          }
      }
@@ -574,10 +705,10 @@ index 45bf986d..037911ac 100644
  }
 \ No newline at end of file
 diff --git a/komelia-ui/src/commonMain/composeResources/values/strings.xml b/komelia-ui/src/commonMain/composeResources/values/strings.xml
-index 33059271..251118d6 100644
+index 33059271..638fc8e8 100644
 --- a/komelia-ui/src/commonMain/composeResources/values/strings.xml
 +++ b/komelia-ui/src/commonMain/composeResources/values/strings.xml
-@@ -580,6 +580,47 @@
+@@ -580,6 +580,50 @@
      <string name="settings_epub_reader_type_ttsu_github">Project on Github</string>
      <string name="settings_image_title">Image Reader</string>
      <string name="settings_image_volume_key_navigation">Volume keys navigation</string>
@@ -598,8 +729,8 @@ index 33059271..251118d6 100644
 +    <string name="settings_image_swipe_details_remote_only">To turn pages only with remote buttons, set all four to “Do nothing”.</string>
 +    <string name="settings_image_remote_buttons">Remote buttons</string>
 +    <string name="settings_image_remote_details_purpose">Teach Komelia the buttons of a Bluetooth page-turner remote. Works in comic and EPUB readers.</string>
-+    <string name="settings_image_remote_details_matching">Buttons are recognized by swipe direction and length, wherever the remote's cursor is.</string>
-+    <string name="settings_image_remote_details_orientation">Each button is learned in portrait and landscape.</string>
++    <string name="settings_image_remote_details_captured">Remotes that move a cursor are read directly, so the cursor is hidden and the edges of the screen don't matter. One press is enough to learn a button.</string>
++    <string name="settings_image_remote_details_screen">Other remotes are recognized by swipe direction and length, and are learned in portrait and landscape.</string>
 +    <string name="settings_image_remote_details_reserved">While buttons are learned, other input from the remote is ignored in readers and its cursor is hidden there.</string>
 +    <string name="settings_image_remote_details_outside">Outside the readers, the remote works like a normal pointer.</string>
 +    <string name="settings_image_remote_none">No buttons learned yet.</string>
@@ -608,11 +739,14 @@ index 33059271..251118d6 100644
 +    <string name="settings_image_remote_remove_all">Remove all</string>
 +    <string name="settings_image_remote_button_action">%1$s → %2$s</string>
 +    <string name="settings_image_remote_tap">Tap</string>
++    <string name="settings_image_remote_orientation_any">Any orientation</string>
 +    <string name="settings_image_remote_orientation_both">Portrait and landscape</string>
 +    <string name="settings_image_remote_orientation_portrait">Portrait only</string>
 +    <string name="settings_image_remote_orientation_landscape">Landscape only</string>
 +    <string name="settings_image_remote_learn_press_title">Press a button on your remote</string>
-+    <string name="settings_image_remote_learn_press_body">Move the remote's cursor into the box, then press the button you want to use. Presses that start outside the box are ignored, so you can use other buttons to move the cursor.</string>
++    <string name="settings_image_remote_learn_press_body">Press the button once, the way you'll use it to turn pages.</string>
++    <string name="settings_image_remote_learn_box_body">Move the remote's cursor into the box, then press the button you want to use. Presses that start outside the box are ignored, so you can use other buttons to move the cursor.</string>
++    <string name="settings_image_remote_learn_not_detected">Not detected?</string>
 +    <string name="settings_image_remote_learn_rotate_landscape">Rotate to landscape, then press the same button again</string>
 +    <string name="settings_image_remote_learn_rotate_portrait">Rotate to portrait, then press the same button again</string>
 +    <string name="settings_image_remote_learn_problem_edge">That press started too close to the edge of the screen. Move the cursor into the box and try again.</string>
@@ -637,6 +771,72 @@ index 5f765966..e0e76b3c 100644
          )
      }
  
+diff --git a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/platform/CapturedPointerInput.kt b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/platform/CapturedPointerInput.kt
+new file mode 100644
+index 00000000..1d66b8ec
+--- /dev/null
++++ b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/platform/CapturedPointerInput.kt
+@@ -0,0 +1,60 @@
++package snd.komelia.ui.platform
++
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.DisposableEffect
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.rememberUpdatedState
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++
++/**
++ * A press of a captured pointer device: its movement between press and release.
++ *
++ * Units depend on the device but are consistent for the same device: touchpad-like devices report
++ * thousandths of the pad's size, mice report raw movement counts.
++ */
++data class CapturedPointerGesture(val deltaX: Float, val deltaY: Float)
++
++/**
++ * Captured pointer input. While a screen listens, the platform captures mouse- and touchpad-like
++ * devices (such as Bluetooth page-turner remotes that move a cursor) and delivers their presses here,
++ * instead of moving the cursor. The cursor is hidden, and screen edges and system edge gestures no
++ * longer interfere. Touchscreen input is unaffected.
++ *
++ * Currently provided on Android (see PointerInputRootLayout); elsewhere nothing is delivered.
++ */
++object CapturedPointerInput {
++    private val listeners = mutableListOf<(CapturedPointerGesture) -> Unit>()
++    private val mutableIsActive = MutableStateFlow(false)
++
++    /** True while any screen listens. The platform keeps pointer capture on while this is true. */
++    val isActive: StateFlow<Boolean> = mutableIsActive.asStateFlow()
++
++    /** Called by the platform for each completed press. Only the most recent listener receives it. */
++    fun dispatch(gesture: CapturedPointerGesture) {
++        listeners.lastOrNull()?.invoke(gesture)
++    }
++
++    internal fun addListener(listener: (CapturedPointerGesture) -> Unit) {
++        listeners.add(listener)
++        mutableIsActive.value = true
++    }
++
++    internal fun removeListener(listener: (CapturedPointerGesture) -> Unit) {
++        listeners.remove(listener)
++        mutableIsActive.value = listeners.isNotEmpty()
++    }
++}
++
++/** Receives captured pointer presses while this is in the composition and [enabled] is true. */
++@Composable
++fun CapturedPointerEffect(enabled: Boolean, onGesture: (CapturedPointerGesture) -> Unit) {
++    val currentOnGesture by rememberUpdatedState(onGesture)
++    DisposableEffect(enabled) {
++        if (!enabled) return@DisposableEffect onDispose {}
++        val listener: (CapturedPointerGesture) -> Unit = { currentOnGesture(it) }
++        CapturedPointerInput.addListener(listener)
++        onDispose { CapturedPointerInput.removeListener(listener) }
++    }
++}
 diff --git a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/platform/PointerVisibility.kt b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/platform/PointerVisibility.kt
 new file mode 100644
 index 00000000..39fb7452
@@ -1025,10 +1225,10 @@ index a18d6099..35236b33 100644
  
 diff --git a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/image/common/ReaderSwipeGestures.kt b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/image/common/ReaderSwipeGestures.kt
 new file mode 100644
-index 00000000..56c99a4a
+index 00000000..4ddf83c7
 --- /dev/null
 +++ b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/image/common/ReaderSwipeGestures.kt
-@@ -0,0 +1,325 @@
+@@ -0,0 +1,221 @@
 +package snd.komelia.ui.reader.image.common
 +
 +import androidx.compose.foundation.gestures.awaitEachGesture
@@ -1048,11 +1248,9 @@ index 00000000..56c99a4a
 +import snd.komelia.settings.model.ReaderSwipeAction
 +import snd.komelia.settings.model.ReaderSwipeActions
 +import snd.komelia.settings.model.ReaderSwipeDirection
++import snd.komelia.ui.platform.CapturedPointerEffect
 +import snd.komelia.ui.reader.image.ScreenScaleState
-+import kotlin.math.PI
 +import kotlin.math.abs
-+import kotlin.math.acos
-+import kotlin.math.hypot
 +
 +/** Swipes slower than this are treated as deliberate drags. */
 +private const val MAX_SWIPE_DURATION_MS = 1000L
@@ -1066,54 +1264,25 @@ index 00000000..56c99a4a
 +/** A swipe that moved a zoomed page by more than this fraction of its length was panning, not swiping. */
 +private const val MAX_PAN_FRACTION = 0.25f
 +
-+/** Movement shorter than this is a tap. */
-+private const val TAP_THRESHOLD_DP = 16f
-+
-+/** Max angle between an input's direction and a learned button's direction. */
-+private const val MAX_BUTTON_ANGLE_DEGREES = 25f
-+
-+/** Allowed length difference between an input and a learned button. */
-+private const val MIN_BUTTON_LENGTH_RATIO = 0.5f
-+private const val MAX_BUTTON_LENGTH_RATIO = 2f
-+
 +/** Inputs ending this close to the edge of the screen may have been cut short by it. */
 +private const val EDGE_MARGIN_DP = 16
-+
-+/** Compose name of finger input. Finger input is never reserved for remote buttons. */
-+private const val TOUCH_POINTER_TYPE = "Touch"
-+
-+/** While learning, a swipe must start in the middle part of the screen along its direction. */
-+private val LEARNING_START_ZONE = 0.25f..0.75f
 +
 +/** Axis a reader scrolls along. Swipes along it are left to the reader, so they keep scrolling. */
 +enum class ReaderScrollAxis { VERTICAL, HORIZONTAL }
 +
-+/** Kind of input a remote button sends. */
-+enum class RemoteButtonKind { TAP, SWIPE_LEFT, SWIPE_RIGHT, SWIPE_UP, SWIPE_DOWN }
-+
-+/**
-+ * A complete input from one pointer, as seen by the reader.
-+ *
-+ * @param button the input's shape, with action [ReaderSwipeAction.NONE].
-+ * @param startFractionX start position as a fraction of the input area width.
-+ * @param startFractionY start position as a fraction of the input area height.
-+ * @param endEdges screen edges the input ended at. A swipe that runs into an edge may have been cut short.
-+ */
-+data class CapturedRemoteInput(
-+    val button: LearnedRemoteButton,
-+    val startFractionX: Float,
-+    val startFractionY: Float,
-+    val endEdges: Set<ReaderSwipeDirection>,
-+)
-+
 +/**
 + * Turns swipes and learned remote buttons into reader actions.
 + *
-+ * Finger input is only observed, so tap zones, panning, scrolling and zooming keep working; the final
-+ * "up" event is consumed when an action runs so the reader doesn't also handle it as a tap or its own swipe.
++ * Finger input is only observed, so tap zones, panning, scrolling and zooming keep working. The final
++ * "up" event is consumed when an action runs, so the reader doesn't also handle it as a tap or its own swipe.
 + *
-+ * Input from a device with learned remote buttons (e.g. a page-turner remote acting as a stylus or
-+ * mouse) is reserved: nothing else in the reader sees it, and it only performs learned actions.
++ * Remote buttons learned through captured pointer input are matched against captured presses
++ * (see [snd.komelia.ui.platform.CapturedPointerInput]). Capture stays on while [enabled] is false, so the
++ * remote's cursor doesn't reappear when e.g. the reader menu opens; presses are just ignored then.
++ *
++ * Remotes that act on the screen instead (e.g. as a stylus) are matched against their screen input.
++ * Input from such a device is reserved: nothing else in the reader sees it, and it only performs
++ * learned actions.
 + *
 + * @param screenScaleState when set, swipes that zoom or pan the page are ignored.
 + * @param scrollAxis when set, swipes along this axis are ignored so the reader keeps scrolling.
@@ -1127,7 +1296,14 @@ index 00000000..56c99a4a
 +): Modifier = composed {
 +    val currentSwipeActions by rememberUpdatedState(swipeActions)
 +    val currentOnAction by rememberUpdatedState(onAction)
++    val currentEnabled by rememberUpdatedState(enabled)
 +    val currentScrollAxis by rememberUpdatedState(scrollAxis)
++
++    CapturedPointerEffect(enabled = swipeActions.learnedRemoteButtons.any { it.isCaptured }) { gesture ->
++        if (!currentEnabled) return@CapturedPointerEffect
++        val button = currentSwipeActions.learnedRemoteButtons.findMatch(gesture.toRemoteButtonInput())
++        if (button != null) currentOnAction(button.action)
++    }
 +    if (!enabled || !swipeActions.isEnabled) return@composed Modifier
 +
 +    Modifier.pointerInput(screenScaleState) {
@@ -1136,16 +1312,15 @@ index 00000000..56c99a4a
 +        awaitEachGesture {
 +            val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
 +            val actions = currentSwipeActions
++            // Finger input is never reserved
 +            val reserved = actions.learnedRemoteButtons.any {
-+                it.action != ReaderSwipeAction.NONE &&
-+                        it.pointerType != TOUCH_POINTER_TYPE &&
-+                        it.pointerType == down.type.toString()
++                it.action != ReaderSwipeAction.NONE && !it.isTouch && it.pointerType == down.type.toString()
 +            }
 +            val startTransform = screenScaleState?.transformation?.value
 +            val gesture = trackGesture(down, reserve = reserved) ?: return@awaitEachGesture
 +
 +            if (actions.remoteButtonsEnabled) {
-+                val button = actions.learnedRemoteButtons.findMatch(toCapturedInput(gesture))
++                val button = actions.learnedRemoteButtons.findMatch(toRemoteButtonInput(gesture))
 +                if (button != null) {
 +                    gesture.consumeUp()
 +                    currentOnAction(button.action)
@@ -1176,101 +1351,22 @@ index 00000000..56c99a4a
 +}
 +
 +/**
-+ * Captures complete inputs for learning remote buttons. All input in this area is consumed.
++ * Reports every complete screen input in this area, for learning remote buttons. All input is consumed.
 + */
-+fun Modifier.remoteButtonCapture(
++fun Modifier.remoteButtonLearningInput(
 +    enabled: Boolean,
-+    onInputCaptured: (CapturedRemoteInput) -> Unit,
++    onInput: (RemoteButtonInput) -> Unit,
 +): Modifier = composed {
-+    val currentOnInputCaptured by rememberUpdatedState(onInputCaptured)
++    val currentOnInput by rememberUpdatedState(onInput)
 +    if (!enabled) return@composed Modifier
 +
 +    Modifier.pointerInput(Unit) {
 +        awaitEachGesture {
 +            val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
 +            val gesture = trackGesture(down, reserve = true) ?: return@awaitEachGesture
-+            currentOnInputCaptured(toCapturedInput(gesture))
++            currentOnInput(toRemoteButtonInput(gesture))
 +        }
 +    }
-+}
-+
-+/**
-+ * True if this input can be learned reliably: a swipe has to start in the middle part of the screen
-+ * along its direction, and no input may end at an edge of the screen, which could have cut it short.
-+ */
-+val CapturedRemoteInput.isReliableForLearning: Boolean
-+    get() {
-+        val kind = button.kind()
-+        if (endEdges.isNotEmpty() && (kind == RemoteButtonKind.TAP || kind.edge() in endEdges)) return false
-+        return when (kind) {
-+            RemoteButtonKind.TAP -> true
-+            RemoteButtonKind.SWIPE_UP, RemoteButtonKind.SWIPE_DOWN -> startFractionY in LEARNING_START_ZONE
-+            RemoteButtonKind.SWIPE_LEFT, RemoteButtonKind.SWIPE_RIGHT -> startFractionX in LEARNING_START_ZONE
-+        }
-+    }
-+
-+fun LearnedRemoteButton.kind(): RemoteButtonKind = when {
-+    hypot(deltaX, deltaY) < TAP_THRESHOLD_DP -> RemoteButtonKind.TAP
-+    abs(deltaX) >= abs(deltaY) -> if (deltaX < 0) RemoteButtonKind.SWIPE_LEFT else RemoteButtonKind.SWIPE_RIGHT
-+    else -> if (deltaY < 0) RemoteButtonKind.SWIPE_UP else RemoteButtonKind.SWIPE_DOWN
-+}
-+
-+/** True if [other] is the same button: same device, orientation and input shape. */
-+fun LearnedRemoteButton.isSameButtonAs(other: LearnedRemoteButton): Boolean {
-+    return pointerType == other.pointerType && landscape == other.landscape && matchesShape(other)
-+}
-+
-+/** Finds the learned button that sent [input], or null. */
-+fun List<LearnedRemoteButton>.findMatch(input: CapturedRemoteInput): LearnedRemoteButton? {
-+    val candidates = filter {
-+        it.action != ReaderSwipeAction.NONE &&
-+                it.pointerType == input.button.pointerType &&
-+                it.landscape == input.button.landscape
-+    }
-+    candidates.filter { it.matchesShape(input.button) }
-+        .minByOrNull { it.angleTo(input.button) }
-+        ?.let { return it }
-+
-+    // The remote's cursor can sit at the edge of the screen (e.g. right after rotating), which cuts its
-+    // swipes short or stops them completely. Accept a shorter movement into that edge, or none at all.
-+    return candidates.filter { it.matchesCutOffInput(input) }.minByOrNull { it.angleTo(input.button) }
-+}
-+
-+private fun LearnedRemoteButton.matchesShape(other: LearnedRemoteButton): Boolean {
-+    val isTap = kind() == RemoteButtonKind.TAP
-+    val otherIsTap = other.kind() == RemoteButtonKind.TAP
-+    if (isTap || otherIsTap) return isTap && otherIsTap
-+
-+    val ratio = other.length() / length()
-+    if (ratio < MIN_BUTTON_LENGTH_RATIO || ratio > MAX_BUTTON_LENGTH_RATIO) return false
-+    return angleTo(other) <= MAX_BUTTON_ANGLE_DEGREES
-+}
-+
-+private fun LearnedRemoteButton.matchesCutOffInput(input: CapturedRemoteInput): Boolean {
-+    val edge = kind().edge() ?: return false
-+    if (edge !in input.endEdges) return false
-+    val other = input.button
-+    if (other.kind() == RemoteButtonKind.TAP) return true
-+    return other.length() <= length() * MAX_BUTTON_LENGTH_RATIO && angleTo(other) <= MAX_BUTTON_ANGLE_DEGREES
-+}
-+
-+private fun LearnedRemoteButton.length() = hypot(deltaX, deltaY)
-+
-+/** Angle in degrees between the movement directions of two inputs (0 for taps). */
-+private fun LearnedRemoteButton.angleTo(other: LearnedRemoteButton): Float {
-+    val length = length()
-+    val otherLength = other.length()
-+    if (length == 0f || otherLength == 0f) return 0f
-+    val cos = ((deltaX * other.deltaX + deltaY * other.deltaY) / (length * otherLength)).coerceIn(-1f, 1f)
-+    return acos(cos) * 180f / PI.toFloat()
-+}
-+
-+private fun RemoteButtonKind.edge(): ReaderSwipeDirection? = when (this) {
-+    RemoteButtonKind.TAP -> null
-+    RemoteButtonKind.SWIPE_LEFT -> ReaderSwipeDirection.LEFT
-+    RemoteButtonKind.SWIPE_RIGHT -> ReaderSwipeDirection.RIGHT
-+    RemoteButtonKind.SWIPE_UP -> ReaderSwipeDirection.UP
-+    RemoteButtonKind.SWIPE_DOWN -> ReaderSwipeDirection.DOWN
 +}
 +
 +private fun ReaderSwipeDirection.axis(): ReaderScrollAxis = when (this) {
@@ -1328,7 +1424,7 @@ index 00000000..56c99a4a
 +    }
 +}
 +
-+private fun AwaitPointerEventScope.toCapturedInput(gesture: TrackedGesture): CapturedRemoteInput {
++private fun AwaitPointerEventScope.toRemoteButtonInput(gesture: TrackedGesture): RemoteButtonInput {
 +    val width = size.width.toFloat().coerceAtLeast(1f)
 +    val height = size.height.toFloat().coerceAtLeast(1f)
 +    val start = gesture.down.position
@@ -1341,7 +1437,7 @@ index 00000000..56c99a4a
 +        if (end.y <= margin) add(ReaderSwipeDirection.UP)
 +        if (end.y >= height - margin) add(ReaderSwipeDirection.DOWN)
 +    }
-+    return CapturedRemoteInput(
++    return RemoteButtonInput(
 +        button = LearnedRemoteButton(
 +            pointerType = gesture.down.type.toString(),
 +            deltaX = delta.x.toDp().value,
@@ -1353,6 +1449,159 @@ index 00000000..56c99a4a
 +        startFractionY = start.y / height,
 +        endEdges = endEdges,
 +    )
++}
+diff --git a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/image/common/RemoteButtons.kt b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/image/common/RemoteButtons.kt
+new file mode 100644
+index 00000000..a106f25a
+--- /dev/null
++++ b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/image/common/RemoteButtons.kt
+@@ -0,0 +1,147 @@
++package snd.komelia.ui.reader.image.common
++
++import snd.komelia.settings.model.LearnedRemoteButton
++import snd.komelia.settings.model.ReaderSwipeAction
++import snd.komelia.settings.model.ReaderSwipeDirection
++import snd.komelia.ui.platform.CapturedPointerGesture
++import kotlin.math.PI
++import kotlin.math.abs
++import kotlin.math.acos
++import kotlin.math.hypot
++
++/** Pointer type of remote buttons learned through captured pointer input. */
++const val CAPTURED_POINTER_TYPE = "Captured"
++
++/** Compose name of finger input. */
++const val TOUCH_POINTER_TYPE = "Touch"
++
++/** Movement shorter than this is a tap (dp for screen input, device units for captured input). */
++private const val TAP_THRESHOLD = 16f
++
++/** Max angle between an input's direction and a learned button's direction. */
++private const val MAX_ANGLE_DEGREES = 25f
++
++/** Allowed length difference between an input and a learned button. */
++private const val MIN_LENGTH_RATIO = 0.5f
++private const val MAX_LENGTH_RATIO = 2f
++
++/** While learning from screen input, a swipe must start in this middle part of the screen along its direction. */
++private val LEARNING_START_ZONE = 0.25f..0.75f
++
++/** Kind of input a remote button sends. */
++enum class RemoteButtonKind { TAP, SWIPE_LEFT, SWIPE_RIGHT, SWIPE_UP, SWIPE_DOWN }
++
++/**
++ * One complete input that may come from a remote button.
++ *
++ * @param button the input's shape, with action [ReaderSwipeAction.NONE].
++ * @param startFractionX start position as a fraction of the input area width (0.5 for captured input).
++ * @param startFractionY start position as a fraction of the input area height (0.5 for captured input).
++ * @param endEdges screen edges the input ended at. A swipe that runs into an edge may have been cut short.
++ */
++data class RemoteButtonInput(
++    val button: LearnedRemoteButton,
++    val startFractionX: Float,
++    val startFractionY: Float,
++    val endEdges: Set<ReaderSwipeDirection>,
++)
++
++/** True if this input came from a finger (or a remote that acts exactly like one). */
++val LearnedRemoteButton.isTouch: Boolean
++    get() = pointerType == TOUCH_POINTER_TYPE
++
++/** True if this button was learned through captured pointer input. It then works in any orientation. */
++val LearnedRemoteButton.isCaptured: Boolean
++    get() = pointerType == CAPTURED_POINTER_TYPE
++
++fun CapturedPointerGesture.toRemoteButtonInput() = RemoteButtonInput(
++    button = LearnedRemoteButton(
++        pointerType = CAPTURED_POINTER_TYPE,
++        deltaX = deltaX,
++        deltaY = deltaY,
++        landscape = false,
++        action = ReaderSwipeAction.NONE,
++    ),
++    startFractionX = 0.5f,
++    startFractionY = 0.5f,
++    endEdges = emptySet(),
++)
++
++/**
++ * True if this input can be learned reliably: a swipe has to start in the middle part of the screen
++ * along its direction, and no input may end at an edge of the screen, which could have cut it short.
++ */
++val RemoteButtonInput.isReliableForLearning: Boolean
++    get() {
++        val kind = button.kind()
++        if (endEdges.isNotEmpty() && (kind == RemoteButtonKind.TAP || kind.edge() in endEdges)) return false
++        return when (kind) {
++            RemoteButtonKind.TAP -> true
++            RemoteButtonKind.SWIPE_UP, RemoteButtonKind.SWIPE_DOWN -> startFractionY in LEARNING_START_ZONE
++            RemoteButtonKind.SWIPE_LEFT, RemoteButtonKind.SWIPE_RIGHT -> startFractionX in LEARNING_START_ZONE
++        }
++    }
++
++fun LearnedRemoteButton.kind(): RemoteButtonKind = when {
++    length() < TAP_THRESHOLD -> RemoteButtonKind.TAP
++    abs(deltaX) >= abs(deltaY) -> if (deltaX < 0) RemoteButtonKind.SWIPE_LEFT else RemoteButtonKind.SWIPE_RIGHT
++    else -> if (deltaY < 0) RemoteButtonKind.SWIPE_UP else RemoteButtonKind.SWIPE_DOWN
++}
++
++/** True if [other] is the same button: same device, orientation and input shape. */
++fun LearnedRemoteButton.isSameButtonAs(other: LearnedRemoteButton): Boolean {
++    return pointerType == other.pointerType && landscape == other.landscape && matchesShape(other)
++}
++
++/** Finds the learned button that sent [input], or null. */
++fun List<LearnedRemoteButton>.findMatch(input: RemoteButtonInput): LearnedRemoteButton? {
++    val candidates = filter {
++        it.action != ReaderSwipeAction.NONE &&
++                it.pointerType == input.button.pointerType &&
++                it.landscape == input.button.landscape
++    }
++    candidates.filter { it.matchesShape(input.button) }
++        .minByOrNull { it.angleTo(input.button) }
++        ?.let { return it }
++
++    // A remote's cursor can sit at the edge of the screen, which cuts its swipes short or stops
++    // them completely. Accept a shorter movement into that edge, or none at all.
++    return candidates.filter { it.matchesCutOffInput(input) }.minByOrNull { it.angleTo(input.button) }
++}
++
++private fun LearnedRemoteButton.matchesShape(other: LearnedRemoteButton): Boolean {
++    val isTap = kind() == RemoteButtonKind.TAP
++    val otherIsTap = other.kind() == RemoteButtonKind.TAP
++    if (isTap || otherIsTap) return isTap && otherIsTap
++
++    val ratio = other.length() / length()
++    if (ratio < MIN_LENGTH_RATIO || ratio > MAX_LENGTH_RATIO) return false
++    return angleTo(other) <= MAX_ANGLE_DEGREES
++}
++
++private fun LearnedRemoteButton.matchesCutOffInput(input: RemoteButtonInput): Boolean {
++    val edge = kind().edge() ?: return false
++    if (edge !in input.endEdges) return false
++    val other = input.button
++    if (other.kind() == RemoteButtonKind.TAP) return true
++    return other.length() <= length() * MAX_LENGTH_RATIO && angleTo(other) <= MAX_ANGLE_DEGREES
++}
++
++private fun LearnedRemoteButton.length() = hypot(deltaX, deltaY)
++
++/** Angle in degrees between the movement directions of two inputs (0 if either is a tap). */
++private fun LearnedRemoteButton.angleTo(other: LearnedRemoteButton): Float {
++    val length = length()
++    val otherLength = other.length()
++    if (length == 0f || otherLength == 0f) return 0f
++    val cos = ((deltaX * other.deltaX + deltaY * other.deltaY) / (length * otherLength)).coerceIn(-1f, 1f)
++    return acos(cos) * 180f / PI.toFloat()
++}
++
++private fun RemoteButtonKind.edge(): ReaderSwipeDirection? = when (this) {
++    RemoteButtonKind.TAP -> null
++    RemoteButtonKind.SWIPE_LEFT -> ReaderSwipeDirection.LEFT
++    RemoteButtonKind.SWIPE_RIGHT -> ReaderSwipeDirection.RIGHT
++    RemoteButtonKind.SWIPE_UP -> ReaderSwipeDirection.UP
++    RemoteButtonKind.SWIPE_DOWN -> ReaderSwipeDirection.DOWN
 +}
 diff --git a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/image/continuous/ContinuousReaderContent.kt b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/image/continuous/ContinuousReaderContent.kt
 index 69bd0cbb..c2cc4498 100644
@@ -1535,63 +1784,262 @@ index 8a6ba5ef..73dbe025 100644
          ScalableContainer(scaleState = screenScaleState) {
              val transitionPage = panelsReaderState.transitionPage.collectAsState().value
 diff --git a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/settings/imagereader/ImageReaderSettingsContent.kt b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/settings/imagereader/ImageReaderSettingsContent.kt
-index 0f053cbe..83706304 100644
+index 0f053cbe..309a08cc 100644
 --- a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/settings/imagereader/ImageReaderSettingsContent.kt
 +++ b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/settings/imagereader/ImageReaderSettingsContent.kt
-@@ -1,22 +1,89 @@
- package snd.komelia.ui.settings.imagereader
+@@ -14,9 +14,13 @@ import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.Res
+ import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.settings_image_clear_cache
+ import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.settings_image_volume_key_navigation
+ import org.jetbrains.compose.resources.stringResource
++import snd.komelia.settings.model.ReaderSwipeAction
++import snd.komelia.settings.model.ReaderSwipeActions
+ import snd.komelia.ui.LocalPlatform
+ import snd.komelia.ui.common.components.SwitchWithLabel
++import snd.komelia.ui.platform.CapturedPointerGesture
+ import snd.komelia.ui.platform.PlatformType
++import snd.komelia.ui.reader.image.common.RemoteButtonInput
+ import snd.komelia.ui.settings.imagereader.onnxruntime.OnnxRuntimeSettingsContent
+ import snd.komelia.ui.settings.imagereader.onnxruntime.OnnxRuntimeSettingsState
+ import snd.komelia.ui.settings.imagereader.onnxruntime.isOnnxRuntimeSupported
+@@ -29,6 +33,16 @@ fun ImageReaderSettingsContent(
+     volumeKeysNavigation: Boolean,
+     onVolumeKeysNavigationChange: (Boolean) -> Unit,
  
-+import androidx.compose.foundation.background
-+import androidx.compose.foundation.border
- import androidx.compose.foundation.layout.Arrangement
-+import androidx.compose.foundation.layout.Box
- import androidx.compose.foundation.layout.Column
++    swipeActions: ReaderSwipeActions,
++    onSwipeActionsChange: (ReaderSwipeActions) -> Unit,
++    remoteButtonLearningStep: RemoteButtonLearningStep,
++    onStartRemoteButtonLearning: () -> Unit,
++    onCancelRemoteButtonLearning: () -> Unit,
++    onRemoteButtonScreenInput: (RemoteButtonInput) -> Unit,
++    onRemoteButtonCapturedInput: (CapturedPointerGesture) -> Unit,
++    onRemoteButtonActionChosen: (ReaderSwipeAction) -> Unit,
++    onSkipRotatedRemoteButtonPress: () -> Unit,
++
+     onCacheClear: () -> Unit,
+     onnxRuntimeSettingsState: OnnxRuntimeSettingsState,
+ ) {
+@@ -51,6 +65,24 @@ fun ImageReaderSettingsContent(
+             )
+         }
+ 
++        SwipeNavigationSettings(
++            swipeActions = swipeActions,
++            onSwipeActionsChange = onSwipeActionsChange,
++        )
++        RemoteButtonSettings(
++            swipeActions = swipeActions,
++            onSwipeActionsChange = onSwipeActionsChange,
++            onLearnClick = onStartRemoteButtonLearning,
++        )
++        RemoteButtonLearningPage(
++            step = remoteButtonLearningStep,
++            onScreenInput = onRemoteButtonScreenInput,
++            onCapturedInput = onRemoteButtonCapturedInput,
++            onActionChosen = onRemoteButtonActionChosen,
++            onSkipRotation = onSkipRotatedRemoteButtonPress,
++            onCancel = onCancelRemoteButtonLearning,
++        )
++
+         FilledTonalButton(
+             onClick = onCacheClear,
+         ) { Text(stringResource(Res.string.settings_image_clear_cache)) }
+diff --git a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/settings/imagereader/ImageReaderSettingsScreen.kt b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/settings/imagereader/ImageReaderSettingsScreen.kt
+index e10cff2b..5776fdb3 100644
+--- a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/settings/imagereader/ImageReaderSettingsScreen.kt
++++ b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/settings/imagereader/ImageReaderSettingsScreen.kt
+@@ -25,6 +25,15 @@ class ImageReaderSettingsScreen : Screen {
+                 onLoadThumbnailPreviewsChange = vm::onLoadThumbnailsPreviewChange,
+                 volumeKeysNavigation = vm.volumeKeysNavigation.collectAsState().value,
+                 onVolumeKeysNavigationChange = vm::onVolumeKeysNavigationChange,
++                swipeActions = vm.swipeActions.collectAsState().value,
++                onSwipeActionsChange = vm::onSwipeActionsChange,
++                remoteButtonLearningStep = vm.remoteButtonLearningStep.collectAsState().value,
++                onStartRemoteButtonLearning = vm::startRemoteButtonLearning,
++                onCancelRemoteButtonLearning = vm::cancelRemoteButtonLearning,
++                onRemoteButtonScreenInput = vm::onRemoteButtonScreenInput,
++                onRemoteButtonCapturedInput = vm::onRemoteButtonCapturedInput,
++                onRemoteButtonActionChosen = vm::onRemoteButtonActionChosen,
++                onSkipRotatedRemoteButtonPress = vm::skipRotatedRemoteButtonPress,
+ 
+                 onCacheClear = vm::onClearImageCache,
+                 onnxRuntimeSettingsState = vm.onnxRuntimeSettingsState,
+diff --git a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/settings/imagereader/ImageReaderSettingsViewModel.kt b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/settings/imagereader/ImageReaderSettingsViewModel.kt
+index d4e8122d..dc47bc36 100644
+--- a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/settings/imagereader/ImageReaderSettingsViewModel.kt
++++ b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/settings/imagereader/ImageReaderSettingsViewModel.kt
+@@ -4,9 +4,15 @@ import cafe.adriel.voyager.core.model.ScreenModel
+ import cafe.adriel.voyager.core.model.screenModelScope
+ import coil3.disk.DiskCache
+ import coil3.memory.MemoryCache
++import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.Res
++import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.settings_image_remote_learned
++import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.settings_image_remote_learned_one_orientation
+ import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
+ import kotlinx.coroutines.flow.first
+ import kotlinx.coroutines.launch
++import org.jetbrains.compose.resources.StringResource
++import org.jetbrains.compose.resources.getString
+ import snd.komelia.AppNotification
+ import snd.komelia.AppNotifications
+ import snd.komelia.image.KomeliaPanelDetector
+@@ -17,6 +23,14 @@ import snd.komelia.image.availableReduceKernels
+ import snd.komelia.image.availableUpsamplingModes
+ import snd.komelia.onnxruntime.OnnxRuntime
+ import snd.komelia.settings.ImageReaderSettingsRepository
++import snd.komelia.settings.model.LearnedRemoteButton
++import snd.komelia.settings.model.ReaderSwipeAction
++import snd.komelia.settings.model.ReaderSwipeActions
++import snd.komelia.ui.platform.CapturedPointerGesture
++import snd.komelia.ui.reader.image.common.RemoteButtonInput
++import snd.komelia.ui.reader.image.common.isReliableForLearning
++import snd.komelia.ui.reader.image.common.isSameButtonAs
++import snd.komelia.ui.reader.image.common.toRemoteButtonInput
+ import snd.komelia.ui.settings.imagereader.onnxruntime.OnnxRuntimeSettingsState
+ import snd.komelia.updates.OnnxModelDownloader
+ import snd.komelia.updates.OnnxRuntimeInstaller
+@@ -51,6 +65,8 @@ class ImageReaderSettingsViewModel(
+     val linearLightDownsampling = MutableStateFlow(false)
+     val loadThumbnailsPreview = MutableStateFlow(false)
+     val volumeKeysNavigation = MutableStateFlow(false)
++    val swipeActions = MutableStateFlow(ReaderSwipeActions())
++    val remoteButtonLearningStep: StateFlow<RemoteButtonLearningStep> = RemoteButtonLearningSession.step
+     val availableUpsamplingModes = availableUpsamplingModes()
+     val availableDownsamplingKernels = availableReduceKernels()
+ 
+@@ -62,6 +78,7 @@ class ImageReaderSettingsViewModel(
+         linearLightDownsampling.value = settingsRepository.getLinearLightDownsampling().first()
+         loadThumbnailsPreview.value = settingsRepository.getLoadThumbnailPreviews().first()
+         volumeKeysNavigation.value = settingsRepository.getVolumeKeysNavigation().first()
++        swipeActions.value = settingsRepository.getSwipeActions().first()
+         onnxRuntimeSettingsState.initialize()
+     }
+ 
+@@ -90,6 +107,85 @@ class ImageReaderSettingsViewModel(
+         screenModelScope.launch { settingsRepository.putVolumeKeysNavigation(enable) }
+     }
+ 
++    fun onSwipeActionsChange(actions: ReaderSwipeActions) {
++        swipeActions.value = actions
++        screenModelScope.launch { settingsRepository.putSwipeActions(actions) }
++    }
++
++    private var learningStep: RemoteButtonLearningStep
++        get() = RemoteButtonLearningSession.step.value
++        set(value) {
++            RemoteButtonLearningSession.step.value = value
++        }
++
++    fun startRemoteButtonLearning() {
++        learningStep = RemoteButtonLearningStep.WaitingForPress()
++    }
++
++    fun cancelRemoteButtonLearning() {
++        learningStep = RemoteButtonLearningStep.Idle
++    }
++
++    /** A press from a remote that acts on the screen. Learned separately for each orientation. */
++    fun onRemoteButtonScreenInput(input: RemoteButtonInput) {
++        val current = learningStep as? RemoteButtonLearningStep.WaitingForPress ?: return
++        val firstPress = current.firstPress
++        learningStep = when {
++            firstPress != null && input.button.landscape == firstPress.landscape ->
++                current.copy(problem = RemoteButtonLearningStep.Problem.NOT_ROTATED)
++
++            !input.isReliableForLearning -> current.copy(problem = RemoteButtonLearningStep.Problem.CURSOR_NEAR_EDGE)
++            firstPress == null -> RemoteButtonLearningStep.ChooseAction(input.button, needsRotatedPress = true)
++            else -> {
++                saveRemoteButton(input.button.copy(action = firstPress.action))
++                notify(Res.string.settings_image_remote_learned)
++                RemoteButtonLearningStep.Idle
++            }
++        }
++    }
++
++    /** A press from a remote read through pointer capture. Works in any orientation. */
++    fun onRemoteButtonCapturedInput(gesture: CapturedPointerGesture) {
++        val current = learningStep as? RemoteButtonLearningStep.WaitingForPress ?: return
++        if (current.firstPress != null) return
++        learningStep = RemoteButtonLearningStep.ChooseAction(
++            press = gesture.toRemoteButtonInput().button,
++            needsRotatedPress = false,
++        )
++    }
++
++    /**
++     * Saves the press with [action] right away. Buttons learned from screen input then wait for a
++     * press in the other orientation.
++     */
++    fun onRemoteButtonActionChosen(action: ReaderSwipeAction) {
++        val current = learningStep as? RemoteButtonLearningStep.ChooseAction ?: return
++        val button = current.press.copy(action = action)
++        saveRemoteButton(button)
++        learningStep = if (current.needsRotatedPress) {
++            RemoteButtonLearningStep.WaitingForPress(firstPress = button)
++        } else {
++            notify(Res.string.settings_image_remote_learned)
++            RemoteButtonLearningStep.Idle
++        }
++    }
++
++    fun skipRotatedRemoteButtonPress() {
++        learningStep = RemoteButtonLearningStep.Idle
++        notify(Res.string.settings_image_remote_learned_one_orientation)
++    }
++
++    /** Adds [button], replacing an earlier copy of the same button. */
++    private fun saveRemoteButton(button: LearnedRemoteButton) {
++        val current = swipeActions.value
++        val buttons = current.learnedRemoteButtons.filterNot { it.isSameButtonAs(button) } + button
++        onSwipeActionsChange(current.copy(learnedRemoteButtons = buttons))
++    }
++
++    private fun notify(message: StringResource) {
++        screenModelScope.launch { appNotifications.add(AppNotification.Success(getString(message))) }
++    }
++
+     fun onClearImageCache() {
+         clearImageCache()
+         appNotifications.add(AppNotification.Success("Cleared image cache"))
+diff --git a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/settings/imagereader/ReaderNavigationSettings.kt b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/settings/imagereader/ReaderNavigationSettings.kt
+new file mode 100644
+index 00000000..3fd38556
+--- /dev/null
++++ b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/settings/imagereader/ReaderNavigationSettings.kt
+@@ -0,0 +1,212 @@
++package snd.komelia.ui.settings.imagereader
++
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Column
 +import androidx.compose.foundation.layout.Row
-+import androidx.compose.foundation.layout.fillMaxSize
 +import androidx.compose.foundation.layout.fillMaxWidth
- import androidx.compose.foundation.layout.padding
-+import androidx.compose.foundation.layout.widthIn
-+import androidx.compose.foundation.shape.RoundedCornerShape
- import androidx.compose.material3.FilledTonalButton
- import androidx.compose.material3.HorizontalDivider
++import androidx.compose.foundation.layout.padding
++import androidx.compose.material3.FilledTonalButton
++import androidx.compose.material3.HorizontalDivider
 +import androidx.compose.material3.MaterialTheme
- import androidx.compose.material3.Text
++import androidx.compose.material3.Text
 +import androidx.compose.material3.TextButton
- import androidx.compose.runtime.Composable
- import androidx.compose.runtime.collectAsState
++import androidx.compose.runtime.Composable
 +import androidx.compose.runtime.getValue
 +import androidx.compose.runtime.mutableStateOf
 +import androidx.compose.runtime.remember
 +import androidx.compose.runtime.setValue
 +import androidx.compose.ui.Alignment
- import androidx.compose.ui.Modifier
-+import androidx.compose.ui.text.style.TextAlign
- import androidx.compose.ui.unit.dp
-+import androidx.compose.ui.window.Dialog
-+import androidx.compose.ui.window.DialogProperties
- import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.Res
-+import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.dialog_cancel
- import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.settings_image_clear_cache
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.unit.dp
++import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.Res
 +import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.settings_image_details_hide
 +import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.settings_image_details_show
 +import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.settings_image_remote_button_action
 +import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.settings_image_remote_buttons
-+import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.settings_image_remote_details_matching
-+import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.settings_image_remote_details_orientation
++import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.settings_image_remote_details_captured
 +import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.settings_image_remote_details_outside
 +import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.settings_image_remote_details_purpose
 +import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.settings_image_remote_details_reserved
++import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.settings_image_remote_details_screen
 +import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.settings_image_remote_learn
-+import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.settings_image_remote_learn_choose_action
-+import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.settings_image_remote_learn_detected
-+import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.settings_image_remote_learn_press_body
-+import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.settings_image_remote_learn_press_title
-+import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.settings_image_remote_learn_problem_edge
-+import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.settings_image_remote_learn_problem_not_rotated
-+import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.settings_image_remote_learn_rotate_landscape
-+import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.settings_image_remote_learn_rotate_portrait
-+import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.settings_image_remote_learn_skip
 +import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.settings_image_remote_none
++import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.settings_image_remote_orientation_any
 +import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.settings_image_remote_orientation_both
 +import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.settings_image_remote_orientation_landscape
 +import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.settings_image_remote_orientation_portrait
@@ -1611,69 +2059,19 @@ index 0f053cbe..83706304 100644
 +import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.settings_image_swipe_navigation
 +import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.settings_image_swipe_right
 +import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.settings_image_swipe_up
- import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.settings_image_volume_key_navigation
- import org.jetbrains.compose.resources.stringResource
++import org.jetbrains.compose.resources.stringResource
 +import snd.komelia.settings.model.ReaderSwipeAction
 +import snd.komelia.settings.model.ReaderSwipeActions
 +import snd.komelia.settings.model.ReaderSwipeDirection
- import snd.komelia.ui.LocalPlatform
 +import snd.komelia.ui.common.components.DropdownChoiceMenu
 +import snd.komelia.ui.common.components.LabeledEntry
- import snd.komelia.ui.common.components.SwitchWithLabel
- import snd.komelia.ui.platform.PlatformType
-+import snd.komelia.ui.reader.image.common.CapturedRemoteInput
 +import snd.komelia.ui.reader.image.common.RemoteButtonKind
++import snd.komelia.ui.reader.image.common.isCaptured
 +import snd.komelia.ui.reader.image.common.kind
-+import snd.komelia.ui.reader.image.common.remoteButtonCapture
- import snd.komelia.ui.settings.imagereader.onnxruntime.OnnxRuntimeSettingsContent
- import snd.komelia.ui.settings.imagereader.onnxruntime.OnnxRuntimeSettingsState
- import snd.komelia.ui.settings.imagereader.onnxruntime.isOnnxRuntimeSupported
-@@ -29,6 +96,15 @@ fun ImageReaderSettingsContent(
-     volumeKeysNavigation: Boolean,
-     onVolumeKeysNavigationChange: (Boolean) -> Unit,
- 
-+    swipeActions: ReaderSwipeActions,
-+    onSwipeActionsChange: (ReaderSwipeActions) -> Unit,
-+    remoteButtonLearningStep: RemoteButtonLearningStep,
-+    onStartRemoteButtonLearning: () -> Unit,
-+    onCancelRemoteButtonLearning: () -> Unit,
-+    onRemoteInputCaptured: (CapturedRemoteInput) -> Unit,
-+    onRemoteButtonActionChosen: (ReaderSwipeAction) -> Unit,
-+    onSkipRotatedRemoteButtonPress: () -> Unit,
 +
-     onCacheClear: () -> Unit,
-     onnxRuntimeSettingsState: OnnxRuntimeSettingsState,
- ) {
-@@ -51,6 +127,23 @@ fun ImageReaderSettingsContent(
-             )
-         }
- 
-+        SwipeNavigationSettings(
-+            swipeActions = swipeActions,
-+            onSwipeActionsChange = onSwipeActionsChange,
-+        )
-+        RemoteButtonSettings(
-+            swipeActions = swipeActions,
-+            onSwipeActionsChange = onSwipeActionsChange,
-+            onLearnClick = onStartRemoteButtonLearning,
-+        )
-+        RemoteButtonLearningDialog(
-+            step = remoteButtonLearningStep,
-+            onInputCaptured = onRemoteInputCaptured,
-+            onActionChosen = onRemoteButtonActionChosen,
-+            onSkipRotation = onSkipRotatedRemoteButtonPress,
-+            onCancel = onCancelRemoteButtonLearning,
-+        )
-+
-         FilledTonalButton(
-             onClick = onCacheClear,
-         ) { Text(stringResource(Res.string.settings_image_clear_cache)) }
-@@ -79,3 +172,250 @@ fun ImageReaderSettingsContent(
-     }
- }
- 
++/** Actions for swipes in the readers (see readerSwipeGestures). */
 +@Composable
-+private fun SwipeNavigationSettings(
++internal fun SwipeNavigationSettings(
 +    swipeActions: ReaderSwipeActions,
 +    onSwipeActionsChange: (ReaderSwipeActions) -> Unit,
 +) {
@@ -1711,8 +2109,9 @@ index 0f053cbe..83706304 100644
 +    }
 +}
 +
++/** Learned buttons of Bluetooth page-turner remotes, and the entry point to learn new ones. */
 +@Composable
-+private fun RemoteButtonSettings(
++internal fun RemoteButtonSettings(
 +    swipeActions: ReaderSwipeActions,
 +    onSwipeActionsChange: (ReaderSwipeActions) -> Unit,
 +    onLearnClick: () -> Unit,
@@ -1723,8 +2122,8 @@ index 0f053cbe..83706304 100644
 +            title = stringResource(Res.string.settings_image_remote_buttons),
 +            details = listOf(
 +                stringResource(Res.string.settings_image_remote_details_purpose),
-+                stringResource(Res.string.settings_image_remote_details_matching),
-+                stringResource(Res.string.settings_image_remote_details_orientation),
++                stringResource(Res.string.settings_image_remote_details_captured),
++                stringResource(Res.string.settings_image_remote_details_screen),
 +                stringResource(Res.string.settings_image_remote_details_reserved),
 +                stringResource(Res.string.settings_image_remote_details_outside),
 +            ),
@@ -1737,9 +2136,12 @@ index 0f053cbe..83706304 100644
 +        }
 +        buttons.forEach { (key, entries) ->
 +            val (_, kind, action) = key
++            val hasPortrait = entries.any { !it.landscape }
++            val hasLandscape = entries.any { it.landscape }
 +            val orientations = when {
-+                entries.any { it.landscape } && entries.any { !it.landscape } -> Res.string.settings_image_remote_orientation_both
-+                entries.any { it.landscape } -> Res.string.settings_image_remote_orientation_landscape
++                entries.any { it.isCaptured } -> Res.string.settings_image_remote_orientation_any
++                hasPortrait && hasLandscape -> Res.string.settings_image_remote_orientation_both
++                hasLandscape -> Res.string.settings_image_remote_orientation_landscape
 +                else -> Res.string.settings_image_remote_orientation_portrait
 +            }
 +            Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1797,32 +2199,185 @@ index 0f053cbe..83706304 100644
 +    }
 +}
 +
++
++@Composable
++internal fun ReaderSwipeAction.label(): String = stringResource(
++    when (this) {
++        ReaderSwipeAction.NONE -> Res.string.settings_image_swipe_action_none
++        ReaderSwipeAction.NEXT_PAGE -> Res.string.settings_image_swipe_action_next_page
++        ReaderSwipeAction.PREVIOUS_PAGE -> Res.string.settings_image_swipe_action_previous_page
++    }
++)
++
++@Composable
++internal fun RemoteButtonKind.label(): String = stringResource(
++    when (this) {
++        RemoteButtonKind.TAP -> Res.string.settings_image_remote_tap
++        RemoteButtonKind.SWIPE_LEFT -> Res.string.settings_image_swipe_left
++        RemoteButtonKind.SWIPE_RIGHT -> Res.string.settings_image_swipe_right
++        RemoteButtonKind.SWIPE_UP -> Res.string.settings_image_swipe_up
++        RemoteButtonKind.SWIPE_DOWN -> Res.string.settings_image_swipe_down
++    }
++)
+diff --git a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/settings/imagereader/RemoteButtonLearning.kt b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/settings/imagereader/RemoteButtonLearning.kt
+new file mode 100644
+index 00000000..fea229de
+--- /dev/null
++++ b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/settings/imagereader/RemoteButtonLearning.kt
+@@ -0,0 +1,51 @@
++package snd.komelia.ui.settings.imagereader
++
++import kotlinx.coroutines.flow.MutableStateFlow
++import snd.komelia.settings.model.LearnedRemoteButton
++
 +/**
-+ * Full-screen page for learning a remote button. Presses only count when they start inside the
-+ * center box, so other remote buttons can be used to move the remote's cursor there first.
++ * Steps of learning a remote button: press it and choose its action.
++ *
++ * Buttons learned through captured pointer input work in any orientation. Buttons learned from
++ * screen input are pressed once more after rotating the screen.
++ */
++sealed interface RemoteButtonLearningStep {
++    data object Idle : RemoteButtonLearningStep
++
++    /**
++     * Waiting for a button press.
++     *
++     * @param firstPress the press already saved in the other orientation, or null for the first press.
++     * @param problem why the last press wasn't used.
++     */
++    data class WaitingForPress(
++        val firstPress: LearnedRemoteButton? = null,
++        val problem: Problem? = null,
++    ) : RemoteButtonLearningStep
++
++    /**
++     * First press captured; waiting for the user to choose what the button does.
++     *
++     * @param needsRotatedPress whether the button must also be pressed in the other orientation.
++     */
++    data class ChooseAction(
++        val press: LearnedRemoteButton,
++        val needsRotatedPress: Boolean,
++    ) : RemoteButtonLearningStep
++
++    enum class Problem {
++        /** The press started too close to the edge of the screen, or ran into it. */
++        CURSOR_NEAR_EDGE,
++
++        /** Second press arrived before the screen was rotated. */
++        NOT_ROTATED,
++    }
++}
++
++/**
++ * Current learning step. Kept for the app process instead of the screen model because on Android
++ * rotating the device (part of the flow) recreates the activity.
++ */
++internal object RemoteButtonLearningSession {
++    val step = MutableStateFlow<RemoteButtonLearningStep>(RemoteButtonLearningStep.Idle)
++}
+diff --git a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/settings/imagereader/RemoteButtonLearningPage.kt b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/settings/imagereader/RemoteButtonLearningPage.kt
+new file mode 100644
+index 00000000..4882d267
+--- /dev/null
++++ b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/settings/imagereader/RemoteButtonLearningPage.kt
+@@ -0,0 +1,196 @@
++package snd.komelia.ui.settings.imagereader
++
++import androidx.compose.foundation.background
++import androidx.compose.foundation.border
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.widthIn
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material3.FilledTonalButton
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.Text
++import androidx.compose.material3.TextButton
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.text.style.TextAlign
++import androidx.compose.ui.unit.IntOffset
++import androidx.compose.ui.unit.IntRect
++import androidx.compose.ui.unit.IntSize
++import androidx.compose.ui.unit.LayoutDirection
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.window.Popup
++import androidx.compose.ui.window.PopupPositionProvider
++import androidx.compose.ui.window.PopupProperties
++import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.Res
++import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.dialog_cancel
++import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.settings_image_remote_learn_box_body
++import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.settings_image_remote_learn_choose_action
++import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.settings_image_remote_learn_detected
++import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.settings_image_remote_learn_not_detected
++import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.settings_image_remote_learn_press_body
++import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.settings_image_remote_learn_press_title
++import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.settings_image_remote_learn_problem_edge
++import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.settings_image_remote_learn_problem_not_rotated
++import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.settings_image_remote_learn_rotate_landscape
++import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.settings_image_remote_learn_rotate_portrait
++import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.settings_image_remote_learn_skip
++import org.jetbrains.compose.resources.stringResource
++import snd.komelia.settings.model.ReaderSwipeAction
++import snd.komelia.ui.platform.BackPressHandler
++import snd.komelia.ui.platform.CapturedPointerEffect
++import snd.komelia.ui.platform.CapturedPointerGesture
++import snd.komelia.ui.reader.image.common.RemoteButtonInput
++import snd.komelia.ui.reader.image.common.isTouch
++import snd.komelia.ui.reader.image.common.kind
++import snd.komelia.ui.reader.image.common.remoteButtonLearningInput
++
++/**
++ * Full-screen page for learning a remote button.
++ *
++ * Remotes that support pointer capture are read directly (see [snd.komelia.ui.platform.CapturedPointerInput]).
++ * Other remotes are read from their screen input; for those, presses only count when they start inside
++ * the center box, so other remote buttons can be used to move the remote's cursor there first.
++ *
++ * Shown as a non-focusable popup rather than a dialog: pointer capture needs the app window to keep focus.
 + */
 +@Composable
-+private fun RemoteButtonLearningDialog(
++internal fun RemoteButtonLearningPage(
 +    step: RemoteButtonLearningStep,
-+    onInputCaptured: (CapturedRemoteInput) -> Unit,
++    onScreenInput: (RemoteButtonInput) -> Unit,
++    onCapturedInput: (CapturedPointerGesture) -> Unit,
 +    onActionChosen: (ReaderSwipeAction) -> Unit,
 +    onSkipRotation: () -> Unit,
 +    onCancel: () -> Unit,
 +) {
 +    if (step == RemoteButtonLearningStep.Idle) return
++    var captureAvailable by remember { mutableStateOf(true) }
++    val waiting = step as? RemoteButtonLearningStep.WaitingForPress
++    val capturing = captureAvailable && waiting != null && waiting.firstPress == null
 +
-+    Dialog(onDismissRequest = onCancel, properties = DialogProperties(usePlatformDefaultWidth = false)) {
++    CapturedPointerEffect(enabled = capturing, onGesture = onCapturedInput)
++    BackPressHandler(onCancel)
++
++    Popup(
++        popupPositionProvider = FullScreenPopupPositionProvider,
++        properties = PopupProperties(focusable = false),
++    ) {
 +        Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surface)) {
-+            // Capture area. The buttons below are drawn on top of it, so tapping them isn't captured.
++            // Screen input area. The buttons below are drawn on top of it, so tapping them isn't recorded.
 +            Box(
 +                modifier = Modifier
 +                    .fillMaxSize()
-+                    .remoteButtonCapture(
-+                        enabled = step is RemoteButtonLearningStep.WaitingForPress,
-+                        onInputCaptured = onInputCaptured,
-+                    ),
++                    .remoteButtonLearningInput(enabled = waiting != null) { input ->
++                        // While the remote is read through capture, screen touches are just fingers
++                        if (!(capturing && input.button.isTouch)) onScreenInput(input)
++                    },
 +            ) {
-+                if (step is RemoteButtonLearningStep.WaitingForPress) {
++                if (waiting != null && !capturing) {
 +                    Box(
 +                        Modifier
 +                            .align(Alignment.Center)
@@ -1837,10 +2392,14 @@ index 0f053cbe..83706304 100644
 +                ) {
 +                    when (step) {
 +                        RemoteButtonLearningStep.Idle -> {}
-+                        is RemoteButtonLearningStep.WaitingForPress -> WaitingForPressText(step)
++                        is RemoteButtonLearningStep.WaitingForPress -> WaitingForPressText(step, showBox = !capturing)
 +                        is RemoteButtonLearningStep.ChooseAction -> {
-+                            LearningTitle(stringResource(Res.string.settings_image_remote_learn_detected, step.press.kind().label()))
-+                            Text(stringResource(Res.string.settings_image_remote_learn_choose_action), textAlign = TextAlign.Center)
++                            val kind = step.press.kind().label()
++                            LearningTitle(stringResource(Res.string.settings_image_remote_learn_detected, kind))
++                            Text(
++                                stringResource(Res.string.settings_image_remote_learn_choose_action),
++                                textAlign = TextAlign.Center,
++                            )
 +                        }
 +                    }
 +                }
@@ -1849,14 +2408,22 @@ index 0f053cbe..83706304 100644
 +            Row(
 +                modifier = Modifier.align(Alignment.BottomCenter).padding(24.dp),
 +                horizontalArrangement = Arrangement.spacedBy(12.dp),
++                verticalAlignment = Alignment.CenterVertically,
 +            ) {
 +                when (step) {
 +                    RemoteButtonLearningStep.Idle -> {}
 +                    is RemoteButtonLearningStep.WaitingForPress ->
 +                        if (step.firstPress == null) {
 +                            TextButton(onClick = onCancel) { Text(stringResource(Res.string.dialog_cancel)) }
++                            if (capturing) {
++                                TextButton(onClick = { captureAvailable = false }) {
++                                    Text(stringResource(Res.string.settings_image_remote_learn_not_detected))
++                                }
++                            }
 +                        } else {
-+                            TextButton(onClick = onSkipRotation) { Text(stringResource(Res.string.settings_image_remote_learn_skip)) }
++                            TextButton(onClick = onSkipRotation) {
++                                Text(stringResource(Res.string.settings_image_remote_learn_skip))
++                            }
 +                        }
 +
 +                    is RemoteButtonLearningStep.ChooseAction -> {
@@ -1874,8 +2441,17 @@ index 0f053cbe..83706304 100644
 +    }
 +}
 +
++private object FullScreenPopupPositionProvider : PopupPositionProvider {
++    override fun calculatePosition(
++        anchorBounds: IntRect,
++        windowSize: IntSize,
++        layoutDirection: LayoutDirection,
++        popupContentSize: IntSize
++    ) = IntOffset.Zero
++}
++
 +@Composable
-+private fun WaitingForPressText(step: RemoteButtonLearningStep.WaitingForPress) {
++private fun WaitingForPressText(step: RemoteButtonLearningStep.WaitingForPress, showBox: Boolean) {
 +    val firstPress = step.firstPress
 +    val title = when {
 +        firstPress == null -> Res.string.settings_image_remote_learn_press_title
@@ -1883,7 +2459,10 @@ index 0f053cbe..83706304 100644
 +        else -> Res.string.settings_image_remote_learn_rotate_landscape
 +    }
 +    LearningTitle(stringResource(title))
-+    Text(stringResource(Res.string.settings_image_remote_learn_press_body), textAlign = TextAlign.Center)
++    val body =
++        if (showBox) Res.string.settings_image_remote_learn_box_body
++        else Res.string.settings_image_remote_learn_press_body
++    Text(stringResource(body), textAlign = TextAlign.Center)
 +
 +    val problem = when (step.problem) {
 +        RemoteButtonLearningStep.Problem.CURSOR_NEAR_EDGE -> Res.string.settings_image_remote_learn_problem_edge
@@ -1898,205 +2477,4 @@ index 0f053cbe..83706304 100644
 +@Composable
 +private fun LearningTitle(text: String) {
 +    Text(text, style = MaterialTheme.typography.headlineSmall, textAlign = TextAlign.Center)
-+}
-+
-+@Composable
-+private fun ReaderSwipeAction.label(): String = stringResource(
-+    when (this) {
-+        ReaderSwipeAction.NONE -> Res.string.settings_image_swipe_action_none
-+        ReaderSwipeAction.NEXT_PAGE -> Res.string.settings_image_swipe_action_next_page
-+        ReaderSwipeAction.PREVIOUS_PAGE -> Res.string.settings_image_swipe_action_previous_page
-+    }
-+)
-+
-+@Composable
-+private fun RemoteButtonKind.label(): String = stringResource(
-+    when (this) {
-+        RemoteButtonKind.TAP -> Res.string.settings_image_remote_tap
-+        RemoteButtonKind.SWIPE_LEFT -> Res.string.settings_image_swipe_left
-+        RemoteButtonKind.SWIPE_RIGHT -> Res.string.settings_image_swipe_right
-+        RemoteButtonKind.SWIPE_UP -> Res.string.settings_image_swipe_up
-+        RemoteButtonKind.SWIPE_DOWN -> Res.string.settings_image_swipe_down
-+    }
-+)
-diff --git a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/settings/imagereader/ImageReaderSettingsScreen.kt b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/settings/imagereader/ImageReaderSettingsScreen.kt
-index e10cff2b..e8a70427 100644
---- a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/settings/imagereader/ImageReaderSettingsScreen.kt
-+++ b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/settings/imagereader/ImageReaderSettingsScreen.kt
-@@ -25,6 +25,14 @@ class ImageReaderSettingsScreen : Screen {
-                 onLoadThumbnailPreviewsChange = vm::onLoadThumbnailsPreviewChange,
-                 volumeKeysNavigation = vm.volumeKeysNavigation.collectAsState().value,
-                 onVolumeKeysNavigationChange = vm::onVolumeKeysNavigationChange,
-+                swipeActions = vm.swipeActions.collectAsState().value,
-+                onSwipeActionsChange = vm::onSwipeActionsChange,
-+                remoteButtonLearningStep = vm.remoteButtonLearningStep.collectAsState().value,
-+                onStartRemoteButtonLearning = vm::startRemoteButtonLearning,
-+                onCancelRemoteButtonLearning = vm::cancelRemoteButtonLearning,
-+                onRemoteInputCaptured = vm::onRemoteInputCaptured,
-+                onRemoteButtonActionChosen = vm::onRemoteButtonActionChosen,
-+                onSkipRotatedRemoteButtonPress = vm::skipRotatedRemoteButtonPress,
- 
-                 onCacheClear = vm::onClearImageCache,
-                 onnxRuntimeSettingsState = vm.onnxRuntimeSettingsState,
-diff --git a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/settings/imagereader/ImageReaderSettingsViewModel.kt b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/settings/imagereader/ImageReaderSettingsViewModel.kt
-index d4e8122d..19bbb504 100644
---- a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/settings/imagereader/ImageReaderSettingsViewModel.kt
-+++ b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/settings/imagereader/ImageReaderSettingsViewModel.kt
-@@ -4,9 +4,15 @@ import cafe.adriel.voyager.core.model.ScreenModel
- import cafe.adriel.voyager.core.model.screenModelScope
- import coil3.disk.DiskCache
- import coil3.memory.MemoryCache
-+import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.Res
-+import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.settings_image_remote_learned
-+import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.settings_image_remote_learned_one_orientation
- import kotlinx.coroutines.flow.MutableStateFlow
-+import kotlinx.coroutines.flow.StateFlow
- import kotlinx.coroutines.flow.first
- import kotlinx.coroutines.launch
-+import org.jetbrains.compose.resources.StringResource
-+import org.jetbrains.compose.resources.getString
- import snd.komelia.AppNotification
- import snd.komelia.AppNotifications
- import snd.komelia.image.KomeliaPanelDetector
-@@ -17,6 +23,12 @@ import snd.komelia.image.availableReduceKernels
- import snd.komelia.image.availableUpsamplingModes
- import snd.komelia.onnxruntime.OnnxRuntime
- import snd.komelia.settings.ImageReaderSettingsRepository
-+import snd.komelia.settings.model.LearnedRemoteButton
-+import snd.komelia.settings.model.ReaderSwipeAction
-+import snd.komelia.settings.model.ReaderSwipeActions
-+import snd.komelia.ui.reader.image.common.CapturedRemoteInput
-+import snd.komelia.ui.reader.image.common.isReliableForLearning
-+import snd.komelia.ui.reader.image.common.isSameButtonAs
- import snd.komelia.ui.settings.imagereader.onnxruntime.OnnxRuntimeSettingsState
- import snd.komelia.updates.OnnxModelDownloader
- import snd.komelia.updates.OnnxRuntimeInstaller
-@@ -51,6 +63,8 @@ class ImageReaderSettingsViewModel(
-     val linearLightDownsampling = MutableStateFlow(false)
-     val loadThumbnailsPreview = MutableStateFlow(false)
-     val volumeKeysNavigation = MutableStateFlow(false)
-+    val swipeActions = MutableStateFlow(ReaderSwipeActions())
-+    val remoteButtonLearningStep: StateFlow<RemoteButtonLearningStep> = RemoteButtonLearningSession.step
-     val availableUpsamplingModes = availableUpsamplingModes()
-     val availableDownsamplingKernels = availableReduceKernels()
- 
-@@ -62,6 +76,7 @@ class ImageReaderSettingsViewModel(
-         linearLightDownsampling.value = settingsRepository.getLinearLightDownsampling().first()
-         loadThumbnailsPreview.value = settingsRepository.getLoadThumbnailPreviews().first()
-         volumeKeysNavigation.value = settingsRepository.getVolumeKeysNavigation().first()
-+        swipeActions.value = settingsRepository.getSwipeActions().first()
-         onnxRuntimeSettingsState.initialize()
-     }
- 
-@@ -90,6 +105,64 @@ class ImageReaderSettingsViewModel(
-         screenModelScope.launch { settingsRepository.putVolumeKeysNavigation(enable) }
-     }
- 
-+    fun onSwipeActionsChange(actions: ReaderSwipeActions) {
-+        swipeActions.value = actions
-+        screenModelScope.launch { settingsRepository.putSwipeActions(actions) }
-+    }
-+
-+    fun startRemoteButtonLearning() {
-+        RemoteButtonLearningSession.step.value = RemoteButtonLearningStep.WaitingForPress()
-+    }
-+
-+    fun cancelRemoteButtonLearning() {
-+        RemoteButtonLearningSession.step.value = RemoteButtonLearningStep.Idle
-+    }
-+
-+    fun onRemoteInputCaptured(input: CapturedRemoteInput) {
-+        val current = RemoteButtonLearningSession.step.value as? RemoteButtonLearningStep.WaitingForPress ?: return
-+        val firstPress = current.firstPress
-+        val problem = when {
-+            firstPress != null && input.button.landscape == firstPress.landscape ->
-+                RemoteButtonLearningStep.Problem.NOT_ROTATED
-+
-+            !input.isReliableForLearning -> RemoteButtonLearningStep.Problem.CURSOR_NEAR_EDGE
-+            else -> null
-+        }
-+        when {
-+            problem != null -> RemoteButtonLearningSession.step.value = current.copy(problem = problem)
-+            firstPress == null -> RemoteButtonLearningSession.step.value = RemoteButtonLearningStep.ChooseAction(input.button)
-+            else -> {
-+                saveRemoteButton(input.button.copy(action = firstPress.action))
-+                RemoteButtonLearningSession.step.value = RemoteButtonLearningStep.Idle
-+                notify(Res.string.settings_image_remote_learned)
-+            }
-+        }
-+    }
-+
-+    /** Saves the first press with [action] right away, then waits for the press in the other orientation. */
-+    fun onRemoteButtonActionChosen(action: ReaderSwipeAction) {
-+        val current = RemoteButtonLearningSession.step.value as? RemoteButtonLearningStep.ChooseAction ?: return
-+        val button = current.press.copy(action = action)
-+        saveRemoteButton(button)
-+        RemoteButtonLearningSession.step.value = RemoteButtonLearningStep.WaitingForPress(firstPress = button)
-+    }
-+
-+    fun skipRotatedRemoteButtonPress() {
-+        RemoteButtonLearningSession.step.value = RemoteButtonLearningStep.Idle
-+        notify(Res.string.settings_image_remote_learned_one_orientation)
-+    }
-+
-+    /** Adds [button], replacing an earlier copy of the same button. */
-+    private fun saveRemoteButton(button: LearnedRemoteButton) {
-+        val current = swipeActions.value
-+        val buttons = current.learnedRemoteButtons.filterNot { it.isSameButtonAs(button) } + button
-+        onSwipeActionsChange(current.copy(learnedRemoteButtons = buttons))
-+    }
-+
-+    private fun notify(message: StringResource) {
-+        screenModelScope.launch { appNotifications.add(AppNotification.Success(getString(message))) }
-+    }
-+
-     fun onClearImageCache() {
-         clearImageCache()
-         appNotifications.add(AppNotification.Success("Cleared image cache"))
-diff --git a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/settings/imagereader/RemoteButtonLearning.kt b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/settings/imagereader/RemoteButtonLearning.kt
-new file mode 100644
-index 00000000..61d9eb33
---- /dev/null
-+++ b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/settings/imagereader/RemoteButtonLearning.kt
-@@ -0,0 +1,41 @@
-+package snd.komelia.ui.settings.imagereader
-+
-+import kotlinx.coroutines.flow.MutableStateFlow
-+import snd.komelia.settings.model.LearnedRemoteButton
-+
-+/**
-+ * Steps of learning a remote button: press it, choose its action, rotate the screen, press it again.
-+ */
-+sealed interface RemoteButtonLearningStep {
-+    data object Idle : RemoteButtonLearningStep
-+
-+    /**
-+     * Waiting for a button press.
-+     *
-+     * @param firstPress the press already saved in the other orientation, or null for the first press.
-+     * @param problem why the last press wasn't used.
-+     */
-+    data class WaitingForPress(
-+        val firstPress: LearnedRemoteButton? = null,
-+        val problem: Problem? = null,
-+    ) : RemoteButtonLearningStep
-+
-+    /** First press captured; waiting for the user to choose what the button does. */
-+    data class ChooseAction(val press: LearnedRemoteButton) : RemoteButtonLearningStep
-+
-+    enum class Problem {
-+        /** The press started too close to the edge of the screen, or ran into it. */
-+        CURSOR_NEAR_EDGE,
-+
-+        /** Second press arrived before the screen was rotated. */
-+        NOT_ROTATED,
-+    }
-+}
-+
-+/**
-+ * Current learning step. Kept for the app process instead of the screen model because on Android
-+ * rotating the device (part of the flow) recreates the activity.
-+ */
-+internal object RemoteButtonLearningSession {
-+    val step = MutableStateFlow<RemoteButtonLearningStep>(RemoteButtonLearningStep.Idle)
 +}
