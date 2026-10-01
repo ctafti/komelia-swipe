@@ -1,0 +1,1603 @@
+diff --git a/komelia-domain/core/src/commonMain/kotlin/snd/komelia/settings/ImageReaderSettingsRepository.kt b/komelia-domain/core/src/commonMain/kotlin/snd/komelia/settings/ImageReaderSettingsRepository.kt
+index 4ce0746..505f34d 100644
+--- a/komelia-domain/core/src/commonMain/kotlin/snd/komelia/settings/ImageReaderSettingsRepository.kt
++++ b/komelia-domain/core/src/commonMain/kotlin/snd/komelia/settings/ImageReaderSettingsRepository.kt
+@@ -10,6 +10,7 @@ import snd.komelia.settings.model.LayoutScaleType
+ import snd.komelia.settings.model.PageDisplayLayout
+ import snd.komelia.settings.model.PagedReadingDirection
+ import snd.komelia.settings.model.ReaderFlashColor
++import snd.komelia.settings.model.ReaderSwipeActions
+ import snd.komelia.settings.model.ReaderType
+ 
+ interface ImageReaderSettingsRepository {
+@@ -67,6 +68,9 @@ interface ImageReaderSettingsRepository {
+     fun getVolumeKeysNavigation(): Flow<Boolean>
+     suspend fun putVolumeKeysNavigation(enable: Boolean)
+ 
++    fun getSwipeActions(): Flow<ReaderSwipeActions>
++    suspend fun putSwipeActions(actions: ReaderSwipeActions)
++
+     fun getUpscalerMode(): Flow<UpscaleMode>
+     suspend fun putUpscalerMode(mode: UpscaleMode)
+ 
+diff --git a/komelia-domain/core/src/commonMain/kotlin/snd/komelia/settings/model/ReaderSwipeActions.kt b/komelia-domain/core/src/commonMain/kotlin/snd/komelia/settings/model/ReaderSwipeActions.kt
+new file mode 100644
+index 0000000..dcbdafc
+--- /dev/null
++++ b/komelia-domain/core/src/commonMain/kotlin/snd/komelia/settings/model/ReaderSwipeActions.kt
+@@ -0,0 +1,70 @@
++package snd.komelia.settings.model
++
++import kotlinx.serialization.Serializable
++
++/**
++ * What a swipe (or learned remote input) in the paged or panels reader should do.
++ * NEXT_PAGE / PREVIOUS_PAGE are literal (not mirrored by reading direction).
++ */
++enum class ReaderSwipeAction {
++    NONE,
++    NEXT_PAGE,
++    PREVIOUS_PAGE,
++}
++
++enum class ReaderSwipeDirection {
++    LEFT,
++    RIGHT,
++    UP,
++    DOWN,
++}
++
++/**
++ * A specific input "learned" from a device such as a Bluetooth page-turner remote.
++ * Positions and movement are stored as fractions of the reader area (0.0 - 1.0),
++ * so the input is recognised again when the remote repeats it.
++ * Remotes send screen coordinates, so each button is learned separately for
++ * portrait and landscape.
++ */
++@Serializable
++data class LearnedReaderGesture(
++    val pointerType: String,
++    val startX: Float,
++    val startY: Float,
++    val deltaX: Float,
++    val deltaY: Float,
++    val landscape: Boolean = false,
++    val action: ReaderSwipeAction = ReaderSwipeAction.NONE,
++)
++
++@Serializable
++data class ReaderSwipeActions(
++    val swipeLeft: ReaderSwipeAction = ReaderSwipeAction.NEXT_PAGE,
++    val swipeRight: ReaderSwipeAction = ReaderSwipeAction.PREVIOUS_PAGE,
++    val swipeUp: ReaderSwipeAction = ReaderSwipeAction.NONE,
++    val swipeDown: ReaderSwipeAction = ReaderSwipeAction.NONE,
++    val learned: List<LearnedReaderGesture> = emptyList(),
++) {
++    fun actionFor(direction: ReaderSwipeDirection): ReaderSwipeAction = when (direction) {
++        ReaderSwipeDirection.LEFT -> swipeLeft
++        ReaderSwipeDirection.RIGHT -> swipeRight
++        ReaderSwipeDirection.UP -> swipeUp
++        ReaderSwipeDirection.DOWN -> swipeDown
++    }
++
++    fun withAction(direction: ReaderSwipeDirection, action: ReaderSwipeAction): ReaderSwipeActions = when (direction) {
++        ReaderSwipeDirection.LEFT -> copy(swipeLeft = action)
++        ReaderSwipeDirection.RIGHT -> copy(swipeRight = action)
++        ReaderSwipeDirection.UP -> copy(swipeUp = action)
++        ReaderSwipeDirection.DOWN -> copy(swipeDown = action)
++    }
++
++    val directionSwipesEnabled: Boolean
++        get() = swipeLeft != ReaderSwipeAction.NONE ||
++                swipeRight != ReaderSwipeAction.NONE ||
++                swipeUp != ReaderSwipeAction.NONE ||
++                swipeDown != ReaderSwipeAction.NONE
++
++    val isEnabled: Boolean
++        get() = directionSwipesEnabled || learned.any { it.action != ReaderSwipeAction.NONE }
++}
+diff --git a/komelia-epub-reader/komga-webui/src/components/EpubReader.vue b/komelia-epub-reader/komga-webui/src/components/EpubReader.vue
+index 404a46b..2b28f1e 100644
+--- a/komelia-epub-reader/komga-webui/src/components/EpubReader.vue
++++ b/komelia-epub-reader/komga-webui/src/components/EpubReader.vue
+@@ -726,11 +726,38 @@ const navigationMode = computed({
+ })
+ 
+ 
++// Komelia: page turns sent by the app (swipes and learned remote buttons).
++// Each call waits until the app requests a page turn. See EpubPageTurnBridge.kt.
++let komeliaPageTurnsActive = true
++
++async function komeliaPageTurnLoop() {
++  const w = window as any
++  while (komeliaPageTurnsActive) {
++    if (typeof w.komeliaAwaitPageTurn !== 'function') {
++      await new Promise(resolve => setTimeout(resolve, 500))
++      continue
++    }
++    let action: string | undefined
++    try {
++      const response = await w.komeliaAwaitPageTurn()
++      action = response?.result
++    } catch (e) {
++      return
++    }
++    if (action === 'closed' || !komeliaPageTurnsActive) return
++    const reader = d2Reader.value as any
++    if (action === 'next' && typeof reader?.nextPage === 'function') reader.nextPage()
++    else if (action === 'previous' && typeof reader?.previousPage === 'function') reader.previousPage()
++  }
++}
++
+ onBeforeUnmount(() => {
++  komeliaPageTurnsActive = false
+   d2Reader.value.stop()
+ })
+ 
+ onMounted(async () => {
++  komeliaPageTurnLoop()
+   let bookId = await externalFunctions.getInitialBookId()
+   let externalSettings = await externalFunctions.getReaderSettings()
+   fullscreenIsAvailable.value = await externalFunctions.isFullscreenAvailable()
+diff --git a/komelia-epub-reader/ttu-ebook-reader/src/lib/components/Reader.svelte b/komelia-epub-reader/ttu-ebook-reader/src/lib/components/Reader.svelte
+index ebcb96d..177e507 100644
+--- a/komelia-epub-reader/ttu-ebook-reader/src/lib/components/Reader.svelte
++++ b/komelia-epub-reader/ttu-ebook-reader/src/lib/components/Reader.svelte
+@@ -340,9 +340,35 @@
+     document.dispatchEvent(new CustomEvent(SKIPKEYLISTENER, {detail: $skipKeyDownListener$}))
+   });
+ 
++  // Komelia: page turns sent by the app (swipes and learned remote buttons).
++  // Each call waits until the app requests a page turn. See EpubPageTurnBridge.kt.
++  // Works in both paginated and continuous modes through the active page manager.
++  let komeliaPageTurnsActive = true;
++
++  async function komeliaPageTurnLoop() {
++    const w = window as any;
++    while (komeliaPageTurnsActive) {
++      if (typeof w.komeliaAwaitPageTurn !== 'function') {
++        await new Promise((resolve) => setTimeout(resolve, 500));
++        continue;
++      }
++      let action: string | undefined;
++      try {
++        const response = await w.komeliaAwaitPageTurn();
++        action = response?.result;
++      } catch (e) {
++        return;
++      }
++      if (action === 'closed' || !komeliaPageTurnsActive) return;
++      if (action === 'next') pageManager?.nextPage();
++      else if (action === 'previous') pageManager?.prevPage();
++    }
++  }
++
+   onMount(() => {
+     // settings = await SettingsStore.getSettingsStore();
+     document.addEventListener('ttu-action', handleAction, false)
++    komeliaPageTurnLoop();
+   });
+ 
+   function handleAction({detail}: any) {
+@@ -357,6 +383,7 @@
+   /** Experimental Code - May be removed any time without warning */
+ 
+   onDestroy(() => {
++    komeliaPageTurnsActive = false;
+     document.removeEventListener('ttu-action', handleAction, false);
+ 
+     readerImageGalleryPictures$.next([]);
+diff --git a/komelia-infra/database/shared/src/commonMain/kotlin/snd/komelia/db/ImageReaderSettings.kt b/komelia-infra/database/shared/src/commonMain/kotlin/snd/komelia/db/ImageReaderSettings.kt
+index 8b27977..33aa34b 100644
+--- a/komelia-infra/database/shared/src/commonMain/kotlin/snd/komelia/db/ImageReaderSettings.kt
++++ b/komelia-infra/database/shared/src/commonMain/kotlin/snd/komelia/db/ImageReaderSettings.kt
+@@ -10,6 +10,7 @@ import snd.komelia.settings.model.LayoutScaleType
+ import snd.komelia.settings.model.PageDisplayLayout
+ import snd.komelia.settings.model.PagedReadingDirection
+ import snd.komelia.settings.model.ReaderFlashColor
++import snd.komelia.settings.model.ReaderSwipeActions
+ import snd.komelia.settings.model.ReaderType
+ import snd.komelia.settings.model.ReaderType.PAGED
+ 
+@@ -34,6 +35,7 @@ data class ImageReaderSettings(
+     val upsamplingMode: UpsamplingMode = UpsamplingMode.CATMULL_ROM,
+     val loadThumbnailPreviews: Boolean = true,
+     val volumeKeysNavigation: Boolean = false,
++    val swipeActions: ReaderSwipeActions = ReaderSwipeActions(),
+ 
+     val ortUpscalerMode: UpscaleMode = UpscaleMode.NONE,
+     val ortUpscalerUserModelPath: PlatformFile? = null,
+diff --git a/komelia-infra/database/shared/src/commonMain/kotlin/snd/komelia/db/repository/ReaderSettingsRepositoryWrapper.kt b/komelia-infra/database/shared/src/commonMain/kotlin/snd/komelia/db/repository/ReaderSettingsRepositoryWrapper.kt
+index 59e4c55..3f58ce1 100644
+--- a/komelia-infra/database/shared/src/commonMain/kotlin/snd/komelia/db/repository/ReaderSettingsRepositoryWrapper.kt
++++ b/komelia-infra/database/shared/src/commonMain/kotlin/snd/komelia/db/repository/ReaderSettingsRepositoryWrapper.kt
+@@ -13,6 +13,7 @@ import snd.komelia.settings.model.LayoutScaleType
+ import snd.komelia.settings.model.PageDisplayLayout
+ import snd.komelia.settings.model.PagedReadingDirection
+ import snd.komelia.settings.model.ReaderFlashColor
++import snd.komelia.settings.model.ReaderSwipeActions
+ import snd.komelia.settings.model.ReaderType
+ 
+ class ReaderSettingsRepositoryWrapper(
+@@ -163,6 +164,14 @@ class ReaderSettingsRepositoryWrapper(
+         wrapper.transform { it.copy(volumeKeysNavigation = enable) }
+     }
+ 
++    override fun getSwipeActions(): Flow<ReaderSwipeActions> {
++        return wrapper.mapState { it.swipeActions }
++    }
++
++    override suspend fun putSwipeActions(actions: ReaderSwipeActions) {
++        wrapper.transform { it.copy(swipeActions = actions) }
++    }
++
+     override fun getUpscalerMode(): Flow<UpscaleMode> {
+         return wrapper.mapState { it.ortUpscalerMode }
+     }
+diff --git a/komelia-infra/database/sqlite/src/commonMain/kotlin/snd/komelia/db/settings/ExposedImageReaderSettingsRepository.kt b/komelia-infra/database/sqlite/src/commonMain/kotlin/snd/komelia/db/settings/ExposedImageReaderSettingsRepository.kt
+index 1049c78..fcf4ff2 100644
+--- a/komelia-infra/database/sqlite/src/commonMain/kotlin/snd/komelia/db/settings/ExposedImageReaderSettingsRepository.kt
++++ b/komelia-infra/database/sqlite/src/commonMain/kotlin/snd/komelia/db/settings/ExposedImageReaderSettingsRepository.kt
+@@ -4,12 +4,16 @@ import io.github.vinceglb.filekit.PlatformFile
+ import io.github.vinceglb.filekit.path
+ import org.jetbrains.exposed.v1.core.eq
+ import org.jetbrains.exposed.v1.jdbc.Database
++import org.jetbrains.exposed.v1.jdbc.SchemaUtils
++import kotlinx.serialization.builtins.ListSerializer
++import kotlinx.serialization.json.Json
+ import org.jetbrains.exposed.v1.jdbc.selectAll
+ import org.jetbrains.exposed.v1.jdbc.upsert
+ import snd.komelia.db.ExposedRepository
+ import snd.komelia.db.ImageReaderSettings
+ import snd.komelia.db.defaultBookId
+ import snd.komelia.db.tables.ImageReaderSettingsTable
++import snd.komelia.db.tables.ImageReaderSwipeSettingsTable
+ import snd.komelia.image.ReduceKernel
+ import snd.komelia.image.UpsamplingMode
+ import snd.komelia.image.UpscaleMode
+@@ -18,12 +22,29 @@ import snd.komelia.settings.model.LayoutScaleType
+ import snd.komelia.settings.model.PageDisplayLayout
+ import snd.komelia.settings.model.PagedReadingDirection
+ import snd.komelia.settings.model.ReaderFlashColor
++import snd.komelia.settings.model.LearnedReaderGesture
++import snd.komelia.settings.model.ReaderSwipeAction
++import snd.komelia.settings.model.ReaderSwipeActions
+ import snd.komelia.settings.model.ReaderType
+ 
+ class ExposedImageReaderSettingsRepository(database: Database) : ExposedRepository(database) {
+ 
+     suspend fun get(): ImageReaderSettings? {
+         return transaction {
++            SchemaUtils.create(ImageReaderSwipeSettingsTable)
++            val swipeActions = ImageReaderSwipeSettingsTable.selectAll()
++                .where { ImageReaderSwipeSettingsTable.bookId.eq(defaultBookId) }
++                .firstOrNull()
++                ?.let {
++                    ReaderSwipeActions(
++                        swipeLeft = parseSwipeAction(it[ImageReaderSwipeSettingsTable.swipeLeft], ReaderSwipeActions().swipeLeft),
++                        swipeRight = parseSwipeAction(it[ImageReaderSwipeSettingsTable.swipeRight], ReaderSwipeActions().swipeRight),
++                        swipeUp = parseSwipeAction(it[ImageReaderSwipeSettingsTable.swipeUp], ReaderSwipeActions().swipeUp),
++                        swipeDown = parseSwipeAction(it[ImageReaderSwipeSettingsTable.swipeDown], ReaderSwipeActions().swipeDown),
++                        learned = decodeLearned(it[ImageReaderSwipeSettingsTable.learnedGestures]),
++                    )
++                } ?: ReaderSwipeActions()
++
+             ImageReaderSettingsTable.selectAll()
+                 .where { ImageReaderSettingsTable.bookId.eq(defaultBookId) }
+                 .firstOrNull()
+@@ -48,6 +69,7 @@ class ExposedImageReaderSettingsRepository(database: Database) : ExposedReposito
+                         upsamplingMode = UpsamplingMode.valueOf(it[ImageReaderSettingsTable.upsamplingMode]),
+                         loadThumbnailPreviews = it[ImageReaderSettingsTable.loadThumbnailPreviews],
+                         volumeKeysNavigation = it[ImageReaderSettingsTable.volumeKeysNavigation],
++                        swipeActions = swipeActions,
+                         ortUpscalerMode = UpscaleMode.valueOf(it[ImageReaderSettingsTable.ortUpscalerMode]),
+                         ortUpscalerUserModelPath = it[ImageReaderSettingsTable.ortUpscalerUserModelPath]
+                             ?.let { PlatformFile(it) },
+@@ -60,6 +82,16 @@ class ExposedImageReaderSettingsRepository(database: Database) : ExposedReposito
+ 
+     suspend fun save(settings: ImageReaderSettings) {
+         transaction {
++            SchemaUtils.create(ImageReaderSwipeSettingsTable)
++            ImageReaderSwipeSettingsTable.upsert {
++                it[bookId] = defaultBookId
++                it[swipeLeft] = settings.swipeActions.swipeLeft.name
++                it[swipeRight] = settings.swipeActions.swipeRight.name
++                it[swipeUp] = settings.swipeActions.swipeUp.name
++                it[swipeDown] = settings.swipeActions.swipeDown.name
++                it[learnedGestures] = learnedJson.encodeToString(learnedSerializer, settings.swipeActions.learned)
++            }
++
+             ImageReaderSettingsTable.upsert {
+                 it[bookId] = defaultBookId
+                 it[readerType] = settings.readerType.name
+@@ -87,4 +119,15 @@ class ExposedImageReaderSettingsRepository(database: Database) : ExposedReposito
+             }
+         }
+     }
+-}
+\ No newline at end of file
++
++    private val learnedJson = Json { ignoreUnknownKeys = true }
++    private val learnedSerializer = ListSerializer(LearnedReaderGesture.serializer())
++
++    private fun decodeLearned(value: String): List<LearnedReaderGesture> {
++        return runCatching { learnedJson.decodeFromString(learnedSerializer, value) }.getOrDefault(emptyList())
++    }
++
++    private fun parseSwipeAction(value: String, default: ReaderSwipeAction): ReaderSwipeAction {
++        return ReaderSwipeAction.entries.firstOrNull { it.name == value } ?: default
++    }
++}
+diff --git a/komelia-infra/database/sqlite/src/commonMain/kotlin/snd/komelia/db/tables/ImageReaderSwipeSettingsTable.kt b/komelia-infra/database/sqlite/src/commonMain/kotlin/snd/komelia/db/tables/ImageReaderSwipeSettingsTable.kt
+new file mode 100644
+index 0000000..a57120d
+--- /dev/null
++++ b/komelia-infra/database/sqlite/src/commonMain/kotlin/snd/komelia/db/tables/ImageReaderSwipeSettingsTable.kt
+@@ -0,0 +1,23 @@
++package snd.komelia.db.tables
++
++import org.jetbrains.exposed.v1.core.Table
++
++/**
++ * Swipe navigation settings for the paged/panels image reader.
++ *
++ * Kept in its own table and created with SchemaUtils (CREATE TABLE IF NOT EXISTS)
++ * instead of a Flyway migration, so it can never clash with migration
++ * versions added upstream.
++ */
++object ImageReaderSwipeSettingsTable : Table("KomeliaSwipeNavigation") {
++    val bookId = text("book_id")
++    val swipeLeft = text("swipe_left")
++    val swipeRight = text("swipe_right")
++    val swipeUp = text("swipe_up")
++    val swipeDown = text("swipe_down")
++
++    /** JSON list of learned remote inputs */
++    val learnedGestures = text("learned_gestures").default("[]")
++
++    override val primaryKey = PrimaryKey(bookId)
++}
+diff --git a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/ViewModelFactory.kt b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/ViewModelFactory.kt
+index 5f76596..e0e76b3 100644
+--- a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/ViewModelFactory.kt
++++ b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/ViewModelFactory.kt
+@@ -653,6 +653,7 @@ class ViewModelFactory(
+             windowState = dependencies.windowState,
+             platformType = platformType,
+             bookSiblingsContext = bookSiblingsContext,
++            imageReaderSettingsRepository = appRepositories.imageReaderSettingsRepository,
+         )
+     }
+ 
+diff --git a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/EpubScreen.kt b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/EpubScreen.kt
+index 745be5b..3c46522 100644
+--- a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/EpubScreen.kt
++++ b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/EpubScreen.kt
+@@ -25,6 +25,11 @@ import snd.komelia.ui.reader.epub.EpubContent
+ import snd.komga.client.book.KomgaBookId
+ import snd.komga.client.book.MediaProfile
+ import kotlin.jvm.Transient
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.ui.Modifier
++import snd.komelia.settings.model.ReaderSwipeActions
++import snd.komelia.ui.reader.image.common.readerSwipeGestures
+ 
+ class EpubScreen(
+     private val bookId: KomgaBookId,
+@@ -85,10 +90,25 @@ class EpubScreen(
+                     }
+                 )
+ 
+-                is LoadState.Success -> EpubContent(
+-                    onWebviewCreated = { state.value.onWebviewCreated(it) },
+-                    onBackButtonPress = state.value::onBackButtonPress
+-                )
++                is LoadState.Success -> {
++                    val readerState = state.value
++                    val swipeActions = vm.swipeActions.collectAsState(ReaderSwipeActions()).value
++                    // Swipe navigation and learned remote buttons also work in EPUB readers.
++                    Box(
++                        Modifier.fillMaxSize().readerSwipeGestures(
++                            enabled = true,
++                            learning = false,
++                            swipeActions = swipeActions,
++                            screenScaleState = null,
++                            onAction = readerState::turnPage,
++                        )
++                    ) {
++                        EpubContent(
++                            onWebviewCreated = { readerState.onWebviewCreated(it) },
++                            onBackButtonPress = readerState::onBackButtonPress
++                        )
++                    }
++                }
+             }
+         }
+     }
+diff --git a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/epub/EpubPageTurnBridge.kt b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/epub/EpubPageTurnBridge.kt
+new file mode 100644
+index 0000000..6e24cf9
+--- /dev/null
++++ b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/epub/EpubPageTurnBridge.kt
+@@ -0,0 +1,48 @@
++package snd.komelia.ui.reader.epub
++
++import kotlinx.coroutines.channels.BufferOverflow
++import kotlinx.coroutines.channels.Channel
++import snd.komelia.settings.model.ReaderSwipeAction
++
++/**
++ * Delivers page turns from Komelia (swipes and learned remote buttons) into an EPUB web reader.
++ *
++ * The web page repeatedly calls the bound function [BIND_NAME]. Each call waits here until a page
++ * turn is requested and then returns "next" or "previous". It returns "closed" when the reader
++ * closes or the web view is recreated (e.g. after rotating), so the old page's loop stops.
++ */
++class EpubPageTurnBridge {
++    private var requests = newChannel()
++
++    /** Call before loading a (new) web view: ends waiting calls from the previous one. */
++    fun reset() {
++        requests.close()
++        requests = newChannel()
++    }
++
++    suspend fun awaitPageTurn(): String {
++        val channel = requests
++        return channel.receiveCatching().getOrNull() ?: CLOSED
++    }
++
++    fun turnPage(action: ReaderSwipeAction) {
++        when (action) {
++            ReaderSwipeAction.NONE -> {}
++            ReaderSwipeAction.NEXT_PAGE -> requests.trySend(NEXT)
++            ReaderSwipeAction.PREVIOUS_PAGE -> requests.trySend(PREVIOUS)
++        }
++    }
++
++    fun close() {
++        requests.close()
++    }
++
++    private fun newChannel() = Channel<String>(capacity = 4, onBufferOverflow = BufferOverflow.DROP_OLDEST)
++
++    companion object {
++        const val BIND_NAME = "komeliaAwaitPageTurn"
++        private const val NEXT = "next"
++        private const val PREVIOUS = "previous"
++        private const val CLOSED = "closed"
++    }
++}
+diff --git a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/epub/EpubReaderViewModel.kt b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/epub/EpubReaderViewModel.kt
+index 93b1c8b..2e0dd45 100644
+--- a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/epub/EpubReaderViewModel.kt
++++ b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/epub/EpubReaderViewModel.kt
+@@ -21,6 +21,10 @@ import snd.komelia.ui.LoadState
+ import snd.komelia.ui.platform.PlatformType
+ import snd.komga.client.book.KomgaBookId
+ import snd.webview.KomeliaWebview
++import kotlinx.coroutines.flow.Flow
++import snd.komelia.settings.ImageReaderSettingsRepository
++import snd.komelia.settings.model.ReaderSwipeAction
++import snd.komelia.settings.model.ReaderSwipeActions
+ 
+ class EpubReaderViewModel(
+     private val bookId: KomgaBookId,
+@@ -36,8 +40,12 @@ class EpubReaderViewModel(
+     private val windowState: AppWindowState,
+     private val platformType: PlatformType,
+     private val bookSiblingsContext: BookSiblingsContext,
++    imageReaderSettingsRepository: ImageReaderSettingsRepository,
+ ) : StateScreenModel<LoadState<EpubReaderState>>(LoadState.Uninitialized) {
+ 
++    /** Swipe navigation and learned remote buttons (shared with the comic reader settings). */
++    val swipeActions: Flow<ReaderSwipeActions> = imageReaderSettingsRepository.getSwipeActions()
++
+     suspend fun initialize(navigator: Navigator) {
+         when (val state = state.value) {
+             LoadState.Loading, is LoadState.Error -> {}
+@@ -104,4 +112,7 @@ interface EpubReaderState {
+     fun onWebviewCreated(webview: KomeliaWebview)
+     fun onBackButtonPress()
+     fun closeWebview()
++
++    /** Turns the page from a Komelia swipe or learned remote button. */
++    fun turnPage(action: ReaderSwipeAction)
+ }
+\ No newline at end of file
+diff --git a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/epub/KomgaEpubReaderState.kt b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/epub/KomgaEpubReaderState.kt
+index c95a2cd..adb4084 100644
+--- a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/epub/KomgaEpubReaderState.kt
++++ b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/epub/KomgaEpubReaderState.kt
+@@ -36,6 +36,7 @@ import snd.komga.client.readlist.KomgaReadListId
+ import snd.komga.client.series.KomgaSeriesId
+ import snd.webview.KomeliaWebview
+ import snd.webview.ResourceLoadResult
++import snd.komelia.settings.model.ReaderSwipeAction
+ 
+ private val logger = KotlinLogging.logger {}
+ private val resourceBaseUriRegex = "^http(s)?://.*/resource/".toRegex()
+@@ -60,6 +61,7 @@ class KomgaEpubReaderState(
+ 
+     val bookId = MutableStateFlow(bookId)
+     private val webview = MutableStateFlow<KomeliaWebview?>(null)
++    private val pageTurnBridge = EpubPageTurnBridge()
+     private val navigator = MutableStateFlow<Navigator?>(null)
+ 
+     override suspend fun initialize(navigator: Navigator) {
+@@ -86,7 +88,10 @@ class KomgaEpubReaderState(
+         closeWebview()
+     }
+ 
++    override fun turnPage(action: ReaderSwipeAction) = pageTurnBridge.turnPage(action)
++
+     override fun closeWebview() {
++        pageTurnBridge.close()
+         webview.value?.close()
+         if (platformType == PlatformType.MOBILE) windowState.setFullscreen(false)
+         navigator.value?.let { nav ->
+@@ -157,6 +162,8 @@ class KomgaEpubReaderState(
+         }
+ 
+         webview.bind<Unit, Unit>("closeBook") { closeWebview() }
++        pageTurnBridge.reset()
++        webview.bind<Unit, String>(EpubPageTurnBridge.BIND_NAME) { pageTurnBridge.awaitPageTurn() }
+ 
+         webview.bind<Unit, String>("getServerUrl") {
+             settingsRepository.getServerUrl().first()
+diff --git a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/epub/TtsuReaderState.kt b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/epub/TtsuReaderState.kt
+index e8f62bb..265827d 100644
+--- a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/epub/TtsuReaderState.kt
++++ b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/epub/TtsuReaderState.kt
+@@ -58,6 +58,7 @@ import snd.webview.ResourceLoadResult
+ import kotlin.math.roundToLong
+ import kotlin.time.Clock
+ import kotlin.time.Instant
++import snd.komelia.settings.model.ReaderSwipeAction
+ 
+ private val logger = KotlinLogging.logger {}
+ private val resourceBaseUriRegex = "^http(s)?://.*/resource/".toRegex()
+@@ -81,6 +82,7 @@ class TtsuReaderState(
+ 
+     val bookId = MutableStateFlow(bookId)
+     private val webview = MutableStateFlow<KomeliaWebview?>(null)
++    private val pageTurnBridge = EpubPageTurnBridge()
+     private val epubLoadTask = CompletableDeferred<TtuEpubData>()
+     private val availableSystemFonts = MutableStateFlow<List<String>>(emptyList())
+     private val selectedFontFile = MutableStateFlow<PlatformFile?>(null)
+@@ -121,7 +123,10 @@ class TtsuReaderState(
+         closeWebview()
+     }
+ 
++    override fun turnPage(action: ReaderSwipeAction) = pageTurnBridge.turnPage(action)
++
+     override fun closeWebview() {
++        pageTurnBridge.close()
+         webview.value?.close()
+         if (platformType == PlatformType.MOBILE) windowState.setFullscreen(false)
+ 
+@@ -168,6 +173,8 @@ class TtsuReaderState(
+         webview.bind<TtuBookmarkData, Unit>("putBookmark") { putBookmark(it) }
+ 
+         webview.bind<Unit, Unit>("closeBook") { closeWebview() }
++        pageTurnBridge.reset()
++        webview.bind<Unit, String>(EpubPageTurnBridge.BIND_NAME) { pageTurnBridge.awaitPageTurn() }
+ 
+         webview.bind<Unit, List<String>>("getAvailableFonts") {
+             availableSystemFonts.value
+diff --git a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/image/ReaderState.kt b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/image/ReaderState.kt
+index 64de85e..716e0a3 100644
+--- a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/image/ReaderState.kt
++++ b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/image/ReaderState.kt
+@@ -11,6 +11,7 @@ import kotlinx.coroutines.SupervisorJob
+ import kotlinx.coroutines.cancel
+ import kotlinx.coroutines.flow.MutableStateFlow
+ import kotlinx.coroutines.flow.SharedFlow
++import kotlinx.coroutines.flow.StateFlow
+ import kotlinx.coroutines.flow.first
+ import kotlinx.coroutines.launch
+ import snd.komelia.AppNotification
+@@ -26,6 +27,10 @@ import snd.komelia.komga.api.KomgaReadListApi
+ import snd.komelia.komga.api.KomgaSeriesApi
+ import snd.komelia.komga.api.model.KomeliaBook
+ import snd.komelia.komga.api.model.KomeliaSeries
++import snd.komelia.settings.model.LearnedReaderGesture
++import snd.komelia.settings.model.ReaderSwipeAction
++import snd.komelia.settings.model.ReaderSwipeActions
++import snd.komelia.ui.reader.image.common.matches
+ import snd.komelia.settings.ImageReaderSettingsRepository
+ import snd.komelia.settings.model.ReaderFlashColor
+ import snd.komelia.settings.model.ReaderType
+@@ -81,6 +86,8 @@ class ReaderState(
+     val flashWith = MutableStateFlow(ReaderFlashColor.BLACK)
+ 
+     val volumeKeysNavigation = MutableStateFlow(false)
++    val swipeActions = MutableStateFlow(ReaderSwipeActions())
++    val remoteLearningStep: StateFlow<RemoteLearningStep> = RemoteLearningSession.step
+     val pixelDensity = MutableStateFlow<Density?>(null)
+ 
+     suspend fun initialize(bookId: KomgaBookId) {
+@@ -95,6 +102,7 @@ class ReaderState(
+         flashEveryNPages.value = readerSettingsRepository.getFlashEveryNPages().first()
+         flashWith.value = readerSettingsRepository.getFlashWith().first()
+         volumeKeysNavigation.value = readerSettingsRepository.getVolumeKeysNavigation().first()
++        swipeActions.value = readerSettingsRepository.getSwipeActions().first()
+ 
+         appNotifications.runCatchingToNotifications {
+             state.value = LoadState.Loading
+@@ -264,6 +272,57 @@ class ReaderState(
+         stateScope.launch { readerSettingsRepository.putCropBorders(trim) }
+     }
+ 
++    fun startLearningRemoteInput() {
++        RemoteLearningSession.step.value = RemoteLearningStep.WaitingForFirstPress
++    }
++
++    fun cancelLearningRemoteInput() {
++        RemoteLearningSession.step.value = RemoteLearningStep.Idle
++    }
++
++    fun onRemoteInputCaptured(input: LearnedReaderGesture) {
++        when (val current = RemoteLearningSession.step.value) {
++            RemoteLearningStep.WaitingForFirstPress -> {
++                RemoteLearningSession.step.value = RemoteLearningStep.ChooseAction(input)
++            }
++
++            is RemoteLearningStep.WaitingForRotatedPress -> {
++                if (input.landscape == current.firstInput.landscape) {
++                    // Pressed before rotating: keep waiting and remind the user to rotate.
++                    RemoteLearningSession.step.value = current.copy(stillSameOrientation = true)
++                } else {
++                    saveLearnedRemoteInput(input.copy(action = current.firstInput.action))
++                    RemoteLearningSession.step.value = RemoteLearningStep.Idle
++                    appNotifications.add(AppNotification.Success("Remote button learned in portrait and landscape"))
++                }
++            }
++
++            else -> {}
++        }
++    }
++
++    /** Saves the first press with [action] right away, then asks for the rotated press. */
++    fun onRemoteActionChosen(action: ReaderSwipeAction) {
++        val current = RemoteLearningSession.step.value as? RemoteLearningStep.ChooseAction ?: return
++        val firstInput = current.firstInput.copy(action = action)
++        saveLearnedRemoteInput(firstInput)
++        RemoteLearningSession.step.value = RemoteLearningStep.WaitingForRotatedPress(firstInput)
++    }
++
++    fun skipRotatedRemoteInput() {
++        RemoteLearningSession.step.value = RemoteLearningStep.Idle
++        appNotifications.add(AppNotification.Normal("Remote button learned for one orientation only"))
++    }
++
++    /** Adds [input], replacing any earlier copy of the same input. */
++    private fun saveLearnedRemoteInput(input: LearnedReaderGesture) {
++        val current = swipeActions.value
++        val learned = current.learned.filterNot { it.matches(input) } + input
++        val updated = current.copy(learned = learned)
++        swipeActions.value = updated
++        stateScope.launch { readerSettingsRepository.putSwipeActions(updated) }
++    }
++
+     fun onFlashEnabledChange(enabled: Boolean) {
+         flashOnPageChange.value = enabled
+         stateScope.launch { readerSettingsRepository.putFlashOnPageChange(enabled) }
+diff --git a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/image/RemoteLearning.kt b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/image/RemoteLearning.kt
+new file mode 100644
+index 0000000..1ac1eca
+--- /dev/null
++++ b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/image/RemoteLearning.kt
+@@ -0,0 +1,38 @@
++package snd.komelia.ui.reader.image
++
++import kotlinx.coroutines.flow.MutableStateFlow
++import snd.komelia.settings.model.LearnedReaderGesture
++
++/**
++ * Steps of teaching the reader a button on a Bluetooth page-turner remote:
++ * press the button, choose what it does, rotate the device, press it again.
++ */
++sealed interface RemoteLearningStep {
++    data object Idle : RemoteLearningStep
++
++    /** Waiting for the first press of a remote button. */
++    data object WaitingForFirstPress : RemoteLearningStep
++
++    /** First press captured; the user picks what the button should do. */
++    data class ChooseAction(val firstInput: LearnedReaderGesture) : RemoteLearningStep
++
++    /**
++     * Waiting for the same button in the other orientation.
++     * [stillSameOrientation] is set when a press arrives before the device was rotated.
++     */
++    data class WaitingForRotatedPress(
++        val firstInput: LearnedReaderGesture,
++        val stillSameOrientation: Boolean = false,
++    ) : RemoteLearningStep
++}
++
++/**
++ * Held for the whole app process rather than inside the reader screen, because on Android
++ * rotating the device recreates the screen and the learning flow must survive that.
++ */
++object RemoteLearningSession {
++    val step = MutableStateFlow<RemoteLearningStep>(RemoteLearningStep.Idle)
++}
++
++val RemoteLearningStep.isCapturing: Boolean
++    get() = this is RemoteLearningStep.WaitingForFirstPress || this is RemoteLearningStep.WaitingForRotatedPress
+diff --git a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/image/common/ReaderContent.kt b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/image/common/ReaderContent.kt
+index a18d609..5739391 100644
+--- a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/image/common/ReaderContent.kt
++++ b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/image/common/ReaderContent.kt
+@@ -57,6 +57,24 @@ import snd.komelia.ui.reader.image.panels.PanelsReaderState
+ import snd.komelia.ui.reader.image.settings.SettingsOverlay
+ import snd.komelia.ui.settings.imagereader.onnxruntime.OnnxRuntimeSettingsState
+ import snd.komelia.ui.strings.AppStrings
++import androidx.compose.foundation.layout.BoxScope
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.width
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material3.AlertDialog
++import androidx.compose.material3.FilledTonalButton
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.Surface
++import androidx.compose.material3.Text
++import androidx.compose.material3.TextButton
++import androidx.compose.ui.unit.dp
++import snd.komelia.settings.model.ReaderSwipeAction
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.widthIn
++import snd.komelia.ui.reader.image.RemoteLearningStep
++import snd.komelia.ui.reader.image.isCapturing
+ 
+ @Composable
+ fun ReaderContent(
+@@ -98,9 +116,25 @@ fun ReaderContent(
+ 
+     val topLevelFocus = remember { FocusRequester() }
+     val volumeKeysNavigation = commonReaderState.volumeKeysNavigation.collectAsState().value
++    val swipeActions = commonReaderState.swipeActions.collectAsState().value
++    val remoteLearningStep = commonReaderState.remoteLearningStep.collectAsState().value
++    val learningRemoteInput = remoteLearningStep.isCapturing
+     var hasFocus by remember { mutableStateOf(false) }
+ 
+-    BackPressHandler { if (showSettingsMenu) showSettingsMenu = false else onExit() }
++    // Leaving the reader always ends any remote-button learning in progress.
++    val exitReader: () -> Unit = {
++        commonReaderState.cancelLearningRemoteInput()
++        onExit()
++    }
++    BackPressHandler {
++        when {
++            showSettingsMenu -> showSettingsMenu = false
++            commonReaderState.remoteLearningStep.value != RemoteLearningStep.Idle ->
++                commonReaderState.cancelLearningRemoteInput()
++
++            else -> exitReader()
++        }
++    }
+     Box(
+         Modifier
+             .fillMaxSize()
+@@ -118,7 +152,7 @@ fun ReaderContent(
+                     Key.M -> showSettingsMenu = !showSettingsMenu
+                     Key.Escape -> showSettingsMenu = false
+                     Key.H -> showHelpDialog = true
+-                    Key.DirectionLeft -> if (event.isAltPressed) onExit() else consumed = false
++                    Key.DirectionLeft -> if (event.isAltPressed) exitReader() else consumed = false
+                     Key.U -> commonReaderState.onStretchToFitCycle()
+                     Key.C -> if (event.isAltPressed) commonReaderState.onColorCorrectionDisable() else consumed = false
+                     else -> consumed = false
+@@ -141,7 +175,10 @@ fun ReaderContent(
+                     onShowSettingsMenuChange = { showSettingsMenu = it },
+                     screenScaleState = screenScaleState,
+                     pagedReaderState = pagedReaderState,
+-                    volumeKeysNavigation = volumeKeysNavigation
++                    volumeKeysNavigation = volumeKeysNavigation,
++                    swipeActions = swipeActions,
++                    learningRemoteInput = learningRemoteInput,
++                    onRemoteInputCaptured = commonReaderState::onRemoteInputCaptured,
+                 )
+             }
+ 
+@@ -153,7 +190,10 @@ fun ReaderContent(
+                     onShowSettingsMenuChange = { showSettingsMenu = it },
+                     screenScaleState = screenScaleState,
+                     continuousReaderState = continuousReaderState,
+-                    volumeKeysNavigation = volumeKeysNavigation
++                    volumeKeysNavigation = volumeKeysNavigation,
++                    swipeActions = swipeActions,
++                    learningRemoteInput = learningRemoteInput,
++                    onRemoteInputCaptured = commonReaderState::onRemoteInputCaptured,
+                 )
+             }
+ 
+@@ -166,7 +206,10 @@ fun ReaderContent(
+                     onShowSettingsMenuChange = { showSettingsMenu = it },
+                     screenScaleState = screenScaleState,
+                     panelsReaderState = panelsReaderState,
+-                    volumeKeysNavigation = volumeKeysNavigation
++                    volumeKeysNavigation = volumeKeysNavigation,
++                    swipeActions = swipeActions,
++                    learningRemoteInput = learningRemoteInput,
++                    onRemoteInputCaptured = commonReaderState::onRemoteInputCaptured,
+                 )
+             }
+ 
+@@ -182,10 +225,22 @@ fun ReaderContent(
+             screenScaleState = screenScaleState,
+             isColorCorrectionsActive = isColorCorrectionActive,
+             onColorCorrectionClick = onColorCorrectionClick,
+-            onBackPress = onExit,
++            onBackPress = exitReader,
+             ohShowHelpDialogChange = { showHelpDialog = it },
+         )
+ 
++        RemoteInputLearningUi(
++            showLearnButton = showSettingsMenu,
++            step = remoteLearningStep,
++            onStartLearning = {
++                showSettingsMenu = false
++                commonReaderState.startLearningRemoteInput()
++            },
++            onCancel = commonReaderState::cancelLearningRemoteInput,
++            onActionChosen = commonReaderState::onRemoteActionChosen,
++            onSkipRotation = commonReaderState::skipRotatedRemoteInput,
++        )
++
+         EInkFlashOverlay(
+             enabled = commonReaderState.flashOnPageChange.collectAsState().value,
+             pageChangeFlow = commonReaderState.pageChangeFlow,
+@@ -297,3 +352,103 @@ private fun ReaderTypeNotification(
+         notifications.add(AppNotification.Normal(str))
+     }
+ }
++
++@Composable
++private fun BoxScope.RemoteInputLearningUi(
++    showLearnButton: Boolean,
++    step: RemoteLearningStep,
++    onStartLearning: () -> Unit,
++    onCancel: () -> Unit,
++    onActionChosen: (ReaderSwipeAction) -> Unit,
++    onSkipRotation: () -> Unit,
++) {
++    if (showLearnButton && step == RemoteLearningStep.Idle) {
++        FilledTonalButton(
++            onClick = onStartLearning,
++            modifier = Modifier.align(Alignment.Center),
++        ) { Text("Learn remote button") }
++    }
++
++    when (step) {
++        RemoteLearningStep.Idle -> {}
++
++        RemoteLearningStep.WaitingForFirstPress -> LearningBanner(
++            message = "Step 1 of 2: press ONE button on your remote.",
++            hint = null,
++            buttonLabel = "Cancel",
++            onButtonClick = onCancel,
++        )
++
++        is RemoteLearningStep.ChooseAction -> AlertDialog(
++            onDismissRequest = onCancel,
++            title = { Text("What should this button do?") },
++            text = {
++                Text(
++                    "Detected: ${step.firstInput.describe()}.\n\n" +
++                            "Next you'll rotate the screen and press the same button again, " +
++                            "so it works in both portrait and landscape."
++                )
++            },
++            confirmButton = {
++                Row {
++                    TextButton(onClick = { onActionChosen(ReaderSwipeAction.PREVIOUS_PAGE) }) { Text("Previous page") }
++                    TextButton(onClick = { onActionChosen(ReaderSwipeAction.NEXT_PAGE) }) { Text("Next page") }
++                }
++            },
++            dismissButton = {
++                TextButton(onClick = onCancel) { Text("Cancel") }
++            },
++        )
++
++        is RemoteLearningStep.WaitingForRotatedPress -> {
++            val target = if (step.firstInput.landscape) "portrait" else "landscape"
++            val current = if (step.firstInput.landscape) "landscape" else "portrait"
++            LearningBanner(
++                message = "Step 2 of 2: rotate to $target, then press the same button again.",
++                hint = if (step.stillSameOrientation) {
++                    "Still in $current. Rotate the screen first (turn off rotation lock if it won't turn)."
++                } else {
++                    null
++                },
++                buttonLabel = "Skip",
++                onButtonClick = onSkipRotation,
++            )
++        }
++    }
++}
++
++@Composable
++private fun BoxScope.LearningBanner(
++    message: String,
++    hint: String?,
++    buttonLabel: String,
++    onButtonClick: () -> Unit,
++) {
++    Surface(
++        modifier = Modifier
++            .align(Alignment.TopCenter)
++            .padding(top = 48.dp, start = 16.dp, end = 16.dp)
++            .widthIn(max = 560.dp),
++        shape = RoundedCornerShape(12.dp),
++        color = MaterialTheme.colorScheme.surfaceVariant,
++        tonalElevation = 4.dp,
++    ) {
++        Row(
++            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
++            verticalAlignment = Alignment.CenterVertically,
++        ) {
++            Column(Modifier.weight(1f, fill = false)) {
++                Text(message)
++                if (hint != null) {
++                    Text(
++                        hint,
++                        style = MaterialTheme.typography.bodySmall,
++                        color = MaterialTheme.colorScheme.error,
++                    )
++                }
++            }
++            Spacer(Modifier.width(12.dp))
++            TextButton(onClick = onButtonClick) { Text(buttonLabel) }
++        }
++    }
++}
+diff --git a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/image/common/ReaderSwipeGestures.kt b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/image/common/ReaderSwipeGestures.kt
+new file mode 100644
+index 0000000..dff11f4
+--- /dev/null
++++ b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/image/common/ReaderSwipeGestures.kt
+@@ -0,0 +1,226 @@
++package snd.komelia.ui.reader.image.common
++
++import androidx.compose.foundation.gestures.awaitEachGesture
++import androidx.compose.foundation.gestures.awaitFirstDown
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.rememberUpdatedState
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.composed
++import androidx.compose.ui.input.pointer.PointerEvent
++import androidx.compose.ui.input.pointer.PointerEventPass
++import androidx.compose.ui.input.pointer.pointerInput
++import androidx.compose.ui.unit.dp
++import snd.komelia.settings.model.LearnedReaderGesture
++import snd.komelia.settings.model.ReaderSwipeAction
++import snd.komelia.settings.model.ReaderSwipeActions
++import snd.komelia.settings.model.ReaderSwipeDirection
++import snd.komelia.ui.reader.image.ScreenScaleState
++import kotlin.math.abs
++
++/** Swipes slower than this are treated as deliberate drags, not swipes. */
++private const val MAX_SWIPE_DURATION_MS = 1000L
++
++/** Minimum finger travel for a direction swipe. */
++private const val MIN_SWIPE_DISTANCE_DP = 40
++
++/** The main axis must be this many times longer than the other axis. */
++private const val DIRECTION_RATIO = 1.5f
++
++/**
++ * If the page itself moved by more than this fraction of the swipe distance,
++ * the gesture was used to pan a zoomed/tall page and is not treated as a swipe.
++ */
++private const val MAX_PAN_FRACTION = 0.25f
++
++/**
++ * How close (as a fraction of the reader width/height) a new input's start point
++ * and movement must be to a learned input to count as "the same" input.
++ */
++private const val LEARNED_MATCH_TOLERANCE = 0.06f
++
++/** Compose's name for finger input. Finger input is never reserved for learned remote buttons. */
++private const val TOUCH_POINTER_TYPE = "Touch"
++
++/** Movement below this fraction of the screen counts as a tap rather than a swipe. */
++private const val TAP_THRESHOLD = 0.03f
++
++/**
++ * Detects reader gestures, including ones emulated by Bluetooth page-turner remotes:
++ *
++ * 1. Learning mode: the next complete input is captured and passed to [onInputCaptured].
++ * 2. Learned inputs: if an input matches a learned one (same pointer type, same start
++ *    point and same movement, within a small tolerance), its action runs. This works
++ *    for remote "taps" too, and takes priority over tap zones and direction swipes.
++ * 3. Direction swipes: left/right/up/down mapped to actions in settings.
++ *
++ * Finger events are observed without being consumed (so tap zones, panning, scrolling and
++ * pinch-zoom keep working); only the final "up" is consumed when an action runs, so the same
++ * gesture can't also trigger the reader's own tap or swipe handling.
++ *
++ * [screenScaleState] is optional (null for readers without zoom, like EPUB). [scrollAxis] marks
++ * readers that scroll, where direction swipes along that axis are ignored so they keep scrolling.
++ */
++/** Axis a reader scrolls along. Direction swipes along this axis are left to the reader (they scroll). */
++enum class ReaderScrollAxis { VERTICAL, HORIZONTAL }
++
++fun Modifier.readerSwipeGestures(
++    enabled: Boolean,
++    learning: Boolean,
++    swipeActions: ReaderSwipeActions,
++    screenScaleState: ScreenScaleState?,
++    onAction: (ReaderSwipeAction) -> Unit,
++    onInputCaptured: (LearnedReaderGesture) -> Unit = {},
++    scrollAxis: ReaderScrollAxis? = null,
++): Modifier = composed {
++    val currentOnAction by rememberUpdatedState(onAction)
++    val currentOnInputCaptured by rememberUpdatedState(onInputCaptured)
++    val currentSwipeActions by rememberUpdatedState(swipeActions)
++    val currentLearning by rememberUpdatedState(learning)
++    val currentScrollAxis by rememberUpdatedState(scrollAxis)
++
++    if (!enabled || (!learning && !swipeActions.isEnabled)) {
++        Modifier
++    } else {
++        Modifier.pointerInput(screenScaleState) {
++            val minDistancePx = MIN_SWIPE_DISTANCE_DP.dp.toPx()
++
++            awaitEachGesture {
++                val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
++                val startPosition = down.position
++                val startTime = down.uptimeMillis
++                val startTransform = screenScaleState?.transformation?.value
++
++                // While learning, and for devices with learned buttons (e.g. a remote that acts as a
++                // stylus), the whole gesture is reserved: nothing else in the reader sees it, so the
++                // remote can't accidentally pan, scroll or hit a tap zone. Fingers ("Touch") are never reserved.
++                val reserved = currentLearning || currentSwipeActions.learned.any {
++                    it.action != ReaderSwipeAction.NONE &&
++                            it.pointerType != TOUCH_POINTER_TYPE &&
++                            it.pointerType == down.type.toString()
++                }
++                if (reserved) down.consume()
++
++                var endPosition = startPosition
++                var endTime = startTime
++                var multiTouch = false
++                var upEvent: PointerEvent? = null
++
++                while (true) {
++                    val event = awaitPointerEvent(PointerEventPass.Initial)
++                    if (reserved) event.changes.forEach { it.consume() }
++                    if (event.changes.count { it.pressed } > 1) multiTouch = true
++
++                    val change = event.changes.firstOrNull { it.id == down.id }
++                    if (change != null) {
++                        endPosition = change.position
++                        endTime = change.uptimeMillis
++                    }
++                    if (event.changes.none { it.pressed }) {
++                        upEvent = event
++                        break
++                    }
++                }
++
++                if (multiTouch) return@awaitEachGesture
++
++                val width = size.width.toFloat().coerceAtLeast(1f)
++                val height = size.height.toFloat().coerceAtLeast(1f)
++                val delta = endPosition - startPosition
++                val input = LearnedReaderGesture(
++                    pointerType = down.type.toString(),
++                    startX = startPosition.x / width,
++                    startY = startPosition.y / height,
++                    deltaX = delta.x / width,
++                    deltaY = delta.y / height,
++                    landscape = width > height,
++                )
++
++                // 1. Learning: capture this exact input.
++                if (currentLearning) {
++                    upEvent?.changes?.forEach { it.consume() }
++                    currentOnInputCaptured(input)
++                    return@awaitEachGesture
++                }
++
++                // 2. Learned inputs from a remote take priority.
++                val learnedMatch = currentSwipeActions.learned.firstOrNull {
++                    it.action != ReaderSwipeAction.NONE && it.matches(input)
++                }
++                if (learnedMatch != null) {
++                    upEvent?.changes?.forEach { it.consume() }
++                    currentOnAction(learnedMatch.action)
++                    return@awaitEachGesture
++                }
++
++                // A remote with learned buttons only does what it was taught.
++                if (reserved) return@awaitEachGesture
++
++                // 3. Generic direction swipes.
++                if (!currentSwipeActions.directionSwipesEnabled) return@awaitEachGesture
++                if (endTime - startTime > MAX_SWIPE_DURATION_MS) return@awaitEachGesture
++
++                val absX = abs(delta.x)
++                val absY = abs(delta.y)
++                val direction = when {
++                    absX >= minDistancePx && absX >= absY * DIRECTION_RATIO ->
++                        if (delta.x < 0) ReaderSwipeDirection.LEFT else ReaderSwipeDirection.RIGHT
++
++                    absY >= minDistancePx && absY >= absX * DIRECTION_RATIO ->
++                        if (delta.y < 0) ReaderSwipeDirection.UP else ReaderSwipeDirection.DOWN
++
++                    else -> null
++                } ?: return@awaitEachGesture
++
++                // In scrolling readers, swipes along the scroll direction just scroll.
++                val alongScrollAxis = when (currentScrollAxis) {
++                    ReaderScrollAxis.VERTICAL -> direction == ReaderSwipeDirection.UP || direction == ReaderSwipeDirection.DOWN
++                    ReaderScrollAxis.HORIZONTAL -> direction == ReaderSwipeDirection.LEFT || direction == ReaderSwipeDirection.RIGHT
++                    null -> false
++                }
++                if (alongScrollAxis) return@awaitEachGesture
++
++                // Ignore gestures that zoomed or panned the page.
++                if (screenScaleState != null && startTransform != null) {
++                    val endTransform = screenScaleState.transformation.value
++                    if (endTransform.scale != startTransform.scale) return@awaitEachGesture
++                    val panned = (endTransform.offset - startTransform.offset).getDistance()
++                    if (panned > delta.getDistance() * MAX_PAN_FRACTION) return@awaitEachGesture
++                }
++
++                val action = currentSwipeActions.actionFor(direction)
++                if (action != ReaderSwipeAction.NONE) {
++                    // Stops a reader's own swipe handling (e.g. in EPUB readers) from turning a second page.
++                    upEvent?.changes?.forEach { it.consume() }
++                    currentOnAction(action)
++                }
++            }
++        }
++    }
++}
++
++/** True if [other] is the same input as this one: same device type, orientation, start point and movement. */
++fun LearnedReaderGesture.matches(other: LearnedReaderGesture): Boolean {
++    return pointerType == other.pointerType &&
++            landscape == other.landscape &&
++            abs(startX - other.startX) <= LEARNED_MATCH_TOLERANCE &&
++            abs(startY - other.startY) <= LEARNED_MATCH_TOLERANCE &&
++            abs(deltaX - other.deltaX) <= LEARNED_MATCH_TOLERANCE &&
++            abs(deltaY - other.deltaY) <= LEARNED_MATCH_TOLERANCE
++}
++
++/** Human readable description, e.g. "Stylus swipe left (portrait)" or "Touch tap (landscape)". */
++fun LearnedReaderGesture.describe(): String {
++    val kind = when {
++        abs(deltaX) < TAP_THRESHOLD && abs(deltaY) < TAP_THRESHOLD -> "tap"
++        abs(deltaX) >= abs(deltaY) -> if (deltaX < 0) "swipe left" else "swipe right"
++        else -> if (deltaY < 0) "swipe up" else "swipe down"
++    }
++    val orientation = if (landscape) "landscape" else "portrait"
++    return "$pointerType $kind ($orientation)"
++}
++
++fun ReaderSwipeAction.label(): String = when (this) {
++    ReaderSwipeAction.NONE -> "Do nothing"
++    ReaderSwipeAction.NEXT_PAGE -> "Next page"
++    ReaderSwipeAction.PREVIOUS_PAGE -> "Previous page"
++}
+diff --git a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/image/continuous/ContinuousReaderContent.kt b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/image/continuous/ContinuousReaderContent.kt
+index 69bd0cb..db83b77 100644
+--- a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/image/continuous/ContinuousReaderContent.kt
++++ b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/image/continuous/ContinuousReaderContent.kt
+@@ -60,6 +60,11 @@ import snd.komelia.ui.reader.image.common.ReaderControlsOverlay
+ import snd.komelia.ui.reader.image.common.ReaderImageContent
+ import snd.komelia.ui.reader.image.common.ScalableContainer
+ import snd.komelia.ui.reader.image.continuous.ContinuousReaderState.BookPagesInterval
++import snd.komelia.settings.model.LearnedReaderGesture
++import snd.komelia.settings.model.ReaderSwipeAction
++import snd.komelia.settings.model.ReaderSwipeActions
++import snd.komelia.ui.reader.image.common.ReaderScrollAxis
++import snd.komelia.ui.reader.image.common.readerSwipeGestures
+ 
+ @Composable
+ fun BoxScope.ContinuousReaderContent(
+@@ -69,7 +74,10 @@ fun BoxScope.ContinuousReaderContent(
+     onShowSettingsMenuChange: (Boolean) -> Unit,
+     screenScaleState: ScreenScaleState,
+     continuousReaderState: ContinuousReaderState,
+-    volumeKeysNavigation: Boolean
++    volumeKeysNavigation: Boolean,
++    swipeActions: ReaderSwipeActions = ReaderSwipeActions(),
++    learningRemoteInput: Boolean = false,
++    onRemoteInputCaptured: (LearnedReaderGesture) -> Unit = {},
+ ) {
+     val coroutineScope = rememberCoroutineScope()
+     val readingDirection = continuousReaderState.readingDirection.collectAsState().value
+@@ -102,6 +110,17 @@ fun BoxScope.ContinuousReaderContent(
+             changeReadingDirection = continuousReaderState::onReadingDirectionChange
+         )
+     }
++    val gestureActionHandler: (ReaderSwipeAction) -> Unit = { action ->
++        when (action) {
++            ReaderSwipeAction.NONE -> {}
++            ReaderSwipeAction.NEXT_PAGE -> coroutineScope.launch { continuousReaderState.scrollScreenForward() }
++            ReaderSwipeAction.PREVIOUS_PAGE -> coroutineScope.launch { continuousReaderState.scrollScreenBackward() }
++        }
++    }
++    val scrollAxis = when (readingDirection) {
++        TOP_TO_BOTTOM -> ReaderScrollAxis.VERTICAL
++        LEFT_TO_RIGHT, RIGHT_TO_LEFT -> ReaderScrollAxis.HORIZONTAL
++    }
+     ReaderControlsOverlay(
+         readingDirection = layoutDirection,
+         onNexPageClick = { coroutineScope.launch { continuousReaderState.scrollScreenForward() } },
+@@ -144,7 +163,15 @@ fun BoxScope.ContinuousReaderContent(
+             }
+ 
+             consumed
+-        }
++        }.readerSwipeGestures(
++            enabled = !showSettingsMenu,
++            learning = learningRemoteInput,
++            swipeActions = swipeActions,
++            screenScaleState = screenScaleState,
++            onAction = gestureActionHandler,
++            onInputCaptured = onRemoteInputCaptured,
++            scrollAxis = scrollAxis,
++        )
+     ) {
+         ScalableContainer(continuousReaderState.screenScaleState) {
+             ReaderPages(state = continuousReaderState)
+diff --git a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/image/paged/PagedReaderContent.kt b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/image/paged/PagedReaderContent.kt
+index 77a58a7..f0bd05f 100644
+--- a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/image/paged/PagedReaderContent.kt
++++ b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/image/paged/PagedReaderContent.kt
+@@ -39,6 +39,10 @@ import snd.komelia.ui.reader.image.paged.PagedReaderState.Page
+ import snd.komelia.ui.reader.image.paged.PagedReaderState.TransitionPage
+ import snd.komelia.ui.reader.image.paged.PagedReaderState.TransitionPage.BookEnd
+ import snd.komelia.ui.reader.image.paged.PagedReaderState.TransitionPage.BookStart
++import snd.komelia.settings.model.ReaderSwipeAction
++import snd.komelia.settings.model.ReaderSwipeActions
++import snd.komelia.settings.model.LearnedReaderGesture
++import snd.komelia.ui.reader.image.common.readerSwipeGestures
+ 
+ @Composable
+ fun BoxScope.PagedReaderContent(
+@@ -48,7 +52,10 @@ fun BoxScope.PagedReaderContent(
+     onShowSettingsMenuChange: (Boolean) -> Unit,
+     screenScaleState: ScreenScaleState,
+     pagedReaderState: PagedReaderState,
+-    volumeKeysNavigation: Boolean
++    volumeKeysNavigation: Boolean,
++    swipeActions: ReaderSwipeActions = ReaderSwipeActions(),
++    learningRemoteInput: Boolean = false,
++    onRemoteInputCaptured: (LearnedReaderGesture) -> Unit = {},
+ ) {
+     if (showHelpDialog) {
+         PagedReaderHelpDialog(onDismissRequest = { onShowHelpDialogChange(false) })
+@@ -66,6 +73,14 @@ fun BoxScope.PagedReaderContent(
+     val currentContainerSize = screenScaleState.areaSize.collectAsState().value
+ 
+     val coroutineScope = rememberCoroutineScope()
++
++    val gestureActionHandler: (ReaderSwipeAction) -> Unit = { action ->
++        when (action) {
++            ReaderSwipeAction.NONE -> {}
++            ReaderSwipeAction.NEXT_PAGE -> coroutineScope.launch { pagedReaderState.nextPage() }
++            ReaderSwipeAction.PREVIOUS_PAGE -> coroutineScope.launch { pagedReaderState.previousPage() }
++        }
++    }
+     ReaderControlsOverlay(
+         readingDirection = layoutDirection,
+         onNexPageClick = pagedReaderState::nextPage,
+@@ -88,7 +103,14 @@ fun BoxScope.PagedReaderContent(
+                 onMoveToPrevPage = { coroutineScope.launch { pagedReaderState.previousPage() } },
+                 volumeKeysNavigation = volumeKeysNavigation
+             )
+-        }
++        }.readerSwipeGestures(
++            enabled = !showSettingsMenu,
++            learning = learningRemoteInput,
++            swipeActions = swipeActions,
++            screenScaleState = screenScaleState,
++            onAction = gestureActionHandler,
++            onInputCaptured = onRemoteInputCaptured,
++        )
+     ) {
+         ScalableContainer(scaleState = screenScaleState) {
+             val transitionPage = pagedReaderState.transitionPage.collectAsState().value
+diff --git a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/image/panels/PanelsReaderContent.kt b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/image/panels/PanelsReaderContent.kt
+index 8a6ba5e..9a61a87 100644
+--- a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/image/panels/PanelsReaderContent.kt
++++ b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/image/panels/PanelsReaderContent.kt
+@@ -36,6 +36,10 @@ import snd.komelia.ui.reader.image.common.ScalableContainer
+ import snd.komelia.ui.reader.image.paged.PagedReaderState.TransitionPage
+ import snd.komelia.ui.reader.image.paged.PagedReaderState.TransitionPage.BookEnd
+ import snd.komelia.ui.reader.image.paged.PagedReaderState.TransitionPage.BookStart
++import snd.komelia.settings.model.ReaderSwipeAction
++import snd.komelia.settings.model.ReaderSwipeActions
++import snd.komelia.settings.model.LearnedReaderGesture
++import snd.komelia.ui.reader.image.common.readerSwipeGestures
+ 
+ @Composable
+ fun BoxScope.PanelsReaderContent(
+@@ -45,7 +49,10 @@ fun BoxScope.PanelsReaderContent(
+     onShowSettingsMenuChange: (Boolean) -> Unit,
+     screenScaleState: ScreenScaleState,
+     panelsReaderState: PanelsReaderState,
+-    volumeKeysNavigation: Boolean
++    volumeKeysNavigation: Boolean,
++    swipeActions: ReaderSwipeActions = ReaderSwipeActions(),
++    learningRemoteInput: Boolean = false,
++    onRemoteInputCaptured: (LearnedReaderGesture) -> Unit = {},
+ ) {
+     if (showHelpDialog) {
+         PagedReaderHelpDialog(onDismissRequest = { onShowHelpDialogChange(false) })
+@@ -60,6 +67,14 @@ fun BoxScope.PanelsReaderContent(
+     val currentContainerSize = screenScaleState.areaSize.collectAsState().value
+ 
+     val coroutineScope = rememberCoroutineScope()
++
++    val gestureActionHandler: (ReaderSwipeAction) -> Unit = { action ->
++        when (action) {
++            ReaderSwipeAction.NONE -> {}
++            ReaderSwipeAction.NEXT_PAGE -> coroutineScope.launch { panelsReaderState.nextPanel() }
++            ReaderSwipeAction.PREVIOUS_PAGE -> coroutineScope.launch { panelsReaderState.previousPanel() }
++        }
++    }
+     ReaderControlsOverlay(
+         readingDirection = layoutDirection,
+         onNexPageClick = panelsReaderState::nextPanel,
+@@ -76,7 +91,14 @@ fun BoxScope.PanelsReaderContent(
+                 onMoveToPrevPage = { coroutineScope.launch { panelsReaderState.previousPanel() } },
+                 volumeKeysNavigation = volumeKeysNavigation
+             )
+-        }
++        }.readerSwipeGestures(
++            enabled = !showSettingsMenu,
++            learning = learningRemoteInput,
++            swipeActions = swipeActions,
++            screenScaleState = screenScaleState,
++            onAction = gestureActionHandler,
++            onInputCaptured = onRemoteInputCaptured,
++        )
+     ) {
+         ScalableContainer(scaleState = screenScaleState) {
+             val transitionPage = panelsReaderState.transitionPage.collectAsState().value
+diff --git a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/settings/imagereader/ImageReaderSettingsContent.kt b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/settings/imagereader/ImageReaderSettingsContent.kt
+index 0f053cb..2d104af 100644
+--- a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/settings/imagereader/ImageReaderSettingsContent.kt
++++ b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/settings/imagereader/ImageReaderSettingsContent.kt
+@@ -20,6 +20,19 @@ import snd.komelia.ui.platform.PlatformType
+ import snd.komelia.ui.settings.imagereader.onnxruntime.OnnxRuntimeSettingsContent
+ import snd.komelia.ui.settings.imagereader.onnxruntime.OnnxRuntimeSettingsState
+ import snd.komelia.ui.settings.imagereader.onnxruntime.isOnnxRuntimeSupported
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.runtime.remember
++import snd.komelia.settings.model.ReaderSwipeAction
++import snd.komelia.settings.model.ReaderSwipeActions
++import snd.komelia.settings.model.ReaderSwipeDirection
++import snd.komelia.ui.common.components.DropdownChoiceMenu
++import snd.komelia.ui.common.components.LabeledEntry
++import androidx.compose.foundation.layout.Row
++import androidx.compose.material3.TextButton
++import androidx.compose.ui.Alignment
++import snd.komelia.ui.reader.image.common.describe
++import snd.komelia.ui.reader.image.common.label
+ 
+ @Composable
+ fun ImageReaderSettingsContent(
+@@ -29,6 +42,9 @@ fun ImageReaderSettingsContent(
+     volumeKeysNavigation: Boolean,
+     onVolumeKeysNavigationChange: (Boolean) -> Unit,
+ 
++    swipeActions: ReaderSwipeActions,
++    onSwipeActionsChange: (ReaderSwipeActions) -> Unit,
++
+     onCacheClear: () -> Unit,
+     onnxRuntimeSettingsState: OnnxRuntimeSettingsState,
+ ) {
+@@ -51,6 +67,15 @@ fun ImageReaderSettingsContent(
+             )
+         }
+ 
++        SwipeNavigationSettings(
++            swipeActions = swipeActions,
++            onSwipeActionsChange = onSwipeActionsChange,
++        )
++        RemoteButtonSettings(
++            swipeActions = swipeActions,
++            onSwipeActionsChange = onSwipeActionsChange,
++        )
++
+         FilledTonalButton(
+             onClick = onCacheClear,
+         ) { Text(stringResource(Res.string.settings_image_clear_cache)) }
+@@ -79,3 +104,129 @@ fun ImageReaderSettingsContent(
+     }
+ }
+ 
++@Composable
++private fun SwipeNavigationSettings(
++    swipeActions: ReaderSwipeActions,
++    onSwipeActionsChange: (ReaderSwipeActions) -> Unit,
++) {
++    val options = remember {
++        listOf(
++            LabeledEntry(ReaderSwipeAction.NONE, ReaderSwipeAction.NONE.label()),
++            LabeledEntry(ReaderSwipeAction.NEXT_PAGE, ReaderSwipeAction.NEXT_PAGE.label()),
++            LabeledEntry(ReaderSwipeAction.PREVIOUS_PAGE, ReaderSwipeAction.PREVIOUS_PAGE.label()),
++        )
++    }
++    val directions = remember {
++        listOf(
++            ReaderSwipeDirection.LEFT to "Swipe left",
++            ReaderSwipeDirection.RIGHT to "Swipe right",
++            ReaderSwipeDirection.UP to "Swipe up",
++            ReaderSwipeDirection.DOWN to "Swipe down",
++        )
++    }
++
++    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
++        HorizontalDivider(Modifier.padding(vertical = 6.dp))
++        Text("Swipe navigation", style = MaterialTheme.typography.titleMedium)
++        Text(
++            "Turn pages by swiping. To have only your learned remote buttons turn pages, " +
++                    "set all four to \"Do nothing\".",
++            style = MaterialTheme.typography.bodySmall,
++        )
++        SettingsNotes(
++            worksIn = "Comic paged, panels and scrolling readers, and both EPUB readers.",
++            limitations = listOf(
++                "In the comic scrolling reader, swipes along the scroll direction keep scrolling; " +
++                        "only swipes across it (e.g. left/right when scrolling down) use these settings.",
++                "Swipes that move a zoomed-in comic page are ignored, so you can still look around a zoomed page.",
++                "Off while the comic reader's menu is open. Komelia can't tell when an EPUB reader's own " +
++                        "menu is open, so a swipe there can still turn the page.",
++                "EPUB readers also have their own swipe page turning, which stays on. When a swipe here is set " +
++                        "to an action, it replaces the EPUB reader's own swipe instead of turning two pages.",
++                "In EPUB scroll mode, swipe up/down actions also scroll the text.",
++                "Changes apply the next time you open a book.",
++            ),
++        )
++        directions.forEach { (direction, directionLabel) ->
++            val current = swipeActions.actionFor(direction)
++            DropdownChoiceMenu(
++                selectedOption = options.firstOrNull { it.value == current },
++                options = options,
++                onOptionChange = { onSwipeActionsChange(swipeActions.withAction(direction, it.value)) },
++                label = { Text(directionLabel) },
++                inputFieldModifier = Modifier.fillMaxWidth(),
++                modifier = Modifier.fillMaxWidth(),
++            )
++        }
++    }
++}
++
++@Composable
++private fun RemoteButtonSettings(
++    swipeActions: ReaderSwipeActions,
++    onSwipeActionsChange: (ReaderSwipeActions) -> Unit,
++) {
++    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
++        HorizontalDivider(Modifier.padding(vertical = 6.dp))
++        Text("Remote buttons", style = MaterialTheme.typography.titleMedium)
++        Text(
++            "Teach Komelia the exact input each button on a Bluetooth page-turner remote sends. " +
++                    "A learned button only reacts to that exact input, separately from swipe navigation.\n\n" +
++                    "To learn a button: open any comic, tap the middle of the page to open the menu, tap " +
++                    "\"Learn remote button\", press the button, choose what it does, then rotate the screen " +
++                    "and press it again so it works in portrait and landscape.",
++            style = MaterialTheme.typography.bodySmall,
++        )
++        SettingsNotes(
++            worksIn = "All comic reader modes (paged, panels, scrolling) and both EPUB readers.",
++            limitations = listOf(
++                "Buttons are learned in the comic reader, then also work in EPUB books.",
++                "Once a button is learned, any other input from that remote is ignored inside readers, so it " +
++                        "can't scroll or hit a tap zone by accident. A real stylus pen that registers the same " +
++                        "way is ignored inside readers too. This doesn't apply if your remote registers as a finger.",
++                "Buttons are matched by where they touch the screen, so learn them in each orientation you " +
++                        "read in, and learn them again if you change the display size or resolution.",
++                "Off while the comic reader's menu is open.",
++                "Outside the readers, the remote still acts like a finger on the touchscreen.",
++                "Not supported in EPUB books in the desktop app.",
++            ),
++        )
++
++        if (swipeActions.learned.isEmpty()) {
++            Text("No remote buttons learned yet.", style = MaterialTheme.typography.bodyMedium)
++        } else {
++            swipeActions.learned.forEachIndexed { index, learned ->
++                Row(verticalAlignment = Alignment.CenterVertically) {
++                    Text(
++                        "${learned.describe()} \u2192 ${learned.action.label()}",
++                        modifier = Modifier.weight(1f),
++                    )
++                    TextButton(onClick = {
++                        onSwipeActionsChange(
++                            swipeActions.copy(learned = swipeActions.learned.filterIndexed { i, _ -> i != index })
++                        )
++                    }) { Text("Remove") }
++                }
++            }
++            TextButton(onClick = { onSwipeActionsChange(swipeActions.copy(learned = emptyList())) }) {
++                Text("Remove all remote buttons")
++            }
++        }
++        HorizontalDivider(Modifier.padding(vertical = 6.dp))
++    }
++}
++
++@Composable
++private fun SettingsNotes(worksIn: String, limitations: List<String>) {
++    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
++        Text("Works in: $worksIn", style = MaterialTheme.typography.bodySmall)
++        Text("Limitations:", style = MaterialTheme.typography.bodySmall)
++        limitations.forEach { limitation ->
++            Text(
++                "\u2022 $limitation",
++                style = MaterialTheme.typography.bodySmall,
++                modifier = Modifier.padding(start = 8.dp),
++            )
++        }
++    }
++}
+diff --git a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/settings/imagereader/ImageReaderSettingsScreen.kt b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/settings/imagereader/ImageReaderSettingsScreen.kt
+index e10cff2..2cf095a 100644
+--- a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/settings/imagereader/ImageReaderSettingsScreen.kt
++++ b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/settings/imagereader/ImageReaderSettingsScreen.kt
+@@ -25,6 +25,8 @@ class ImageReaderSettingsScreen : Screen {
+                 onLoadThumbnailPreviewsChange = vm::onLoadThumbnailsPreviewChange,
+                 volumeKeysNavigation = vm.volumeKeysNavigation.collectAsState().value,
+                 onVolumeKeysNavigationChange = vm::onVolumeKeysNavigationChange,
++                swipeActions = vm.swipeActions.collectAsState().value,
++                onSwipeActionsChange = vm::onSwipeActionsChange,
+ 
+                 onCacheClear = vm::onClearImageCache,
+                 onnxRuntimeSettingsState = vm.onnxRuntimeSettingsState,
+diff --git a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/settings/imagereader/ImageReaderSettingsViewModel.kt b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/settings/imagereader/ImageReaderSettingsViewModel.kt
+index d4e8122..2a94175 100644
+--- a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/settings/imagereader/ImageReaderSettingsViewModel.kt
++++ b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/settings/imagereader/ImageReaderSettingsViewModel.kt
+@@ -20,6 +20,7 @@ import snd.komelia.settings.ImageReaderSettingsRepository
+ import snd.komelia.ui.settings.imagereader.onnxruntime.OnnxRuntimeSettingsState
+ import snd.komelia.updates.OnnxModelDownloader
+ import snd.komelia.updates.OnnxRuntimeInstaller
++import snd.komelia.settings.model.ReaderSwipeActions
+ 
+ class ImageReaderSettingsViewModel(
+     private val settingsRepository: ImageReaderSettingsRepository,
+@@ -51,6 +52,7 @@ class ImageReaderSettingsViewModel(
+     val linearLightDownsampling = MutableStateFlow(false)
+     val loadThumbnailsPreview = MutableStateFlow(false)
+     val volumeKeysNavigation = MutableStateFlow(false)
++    val swipeActions = MutableStateFlow(ReaderSwipeActions())
+     val availableUpsamplingModes = availableUpsamplingModes()
+     val availableDownsamplingKernels = availableReduceKernels()
+ 
+@@ -62,6 +64,7 @@ class ImageReaderSettingsViewModel(
+         linearLightDownsampling.value = settingsRepository.getLinearLightDownsampling().first()
+         loadThumbnailsPreview.value = settingsRepository.getLoadThumbnailPreviews().first()
+         volumeKeysNavigation.value = settingsRepository.getVolumeKeysNavigation().first()
++        swipeActions.value = settingsRepository.getSwipeActions().first()
+         onnxRuntimeSettingsState.initialize()
+     }
+ 
+@@ -90,6 +93,11 @@ class ImageReaderSettingsViewModel(
+         screenModelScope.launch { settingsRepository.putVolumeKeysNavigation(enable) }
+     }
+ 
++    fun onSwipeActionsChange(actions: ReaderSwipeActions) {
++        swipeActions.value = actions
++        screenModelScope.launch { settingsRepository.putSwipeActions(actions) }
++    }
++
+     fun onClearImageCache() {
+         clearImageCache()
+         appNotifications.add(AppNotification.Success("Cleared image cache"))
