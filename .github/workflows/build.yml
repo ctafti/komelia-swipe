@@ -1,0 +1,173 @@
+name: Build Komelia Swipe
+
+on:
+  workflow_dispatch:
+    inputs:
+      komelia_ref:
+        description: "Komelia version (git tag) to build"
+        required: true
+        default: "0.20.0"
+      arch:
+        description: "Tablet CPU type (aarch64 = almost every modern device)"
+        required: true
+        default: "aarch64"
+        type: choice
+        options:
+          - aarch64
+          - armv7a
+
+permissions:
+  contents: write # saves the signing key on the first run and publishes the APK as a release
+
+env:
+  ARCH: ${{ inputs.arch }}
+  KEY_PASS: komelia-swipe
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/local/share/boost \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/powershell /usr/share/swift || true
+          df -h /
+
+      - name: Check out this repository (patch + signing key)
+        uses: actions/checkout@v7
+        with:
+          path: kit
+
+      - name: Create signing key (first run only)
+        working-directory: kit
+        run: |
+          if [ -f signing/komelia-swipe.jks ]; then
+            echo "Using existing signing key"
+            exit 0
+          fi
+          mkdir -p signing
+          keytool -genkeypair -keystore signing/komelia-swipe.jks \
+            -storepass "$KEY_PASS" -keypass "$KEY_PASS" -alias komelia-swipe \
+            -keyalg RSA -keysize 4096 -validity 36500 \
+            -dname "CN=Komelia Swipe personal build"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add signing/komelia-swipe.jks
+          git commit -m "Add signing key for Komelia Swipe builds"
+          git push
+
+      - name: Check out Komelia ${{ inputs.komelia_ref }}
+        uses: actions/checkout@v7
+        with:
+          repository: Snd-R/Komelia
+          ref: ${{ inputs.komelia_ref }}
+          path: komelia
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Apply swipe navigation patch
+        working-directory: komelia
+        run: git apply --verbose ../kit/swipe-navigation.patch
+
+      - name: Make it a separate app named "Komelia Swipe"
+        working-directory: komelia
+        run: |
+          sed -i 's/applicationId = "io.github.snd_r.komelia"/applicationId = "io.github.snd_r.komelia.swipe"/' \
+            komelia-app/androidApp/build.gradle.kts
+          grep -q 'applicationId = "io.github.snd_r.komelia.swipe"' komelia-app/androidApp/build.gradle.kts
+          sed -i 's|<string name="app_name">[^<]*</string>|<string name="app_name">Komelia Swipe</string>|' \
+            komelia-app/androidApp/src/main/res/values*/strings.xml
+          # F-Droid flavour: no self-updater that would offer the official app
+          sed -i 's/^snd.android.variant=.*/snd.android.variant=fdroid/' gradle.properties
+          grep -n "snd.android.variant" gradle.properties
+
+      - name: Cache key for native libraries
+        id: native
+        working-directory: komelia
+        run: echo "key=native-${ARCH}-$(git rev-parse HEAD)-${{ hashFiles('komelia/cmake/**', 'komelia/CMakeLists.txt') }}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore native libraries from cache
+        id: native-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: komelia/cmake/build-android-${{ inputs.arch }}/sysroot/lib
+          key: ${{ steps.native.outputs.key }}
+
+      - name: Build native libraries (slow, first run only)
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        working-directory: komelia
+        run: |
+          if ! docker build -t komelia-build-android - < ./cmake/android.Dockerfile; then
+            echo "Docker image build failed, retrying with an Ubuntu 26.04 base image"
+            sed -i 's/^FROM ubuntu:.*/FROM ubuntu:26.04/' ./cmake/android.Dockerfile
+            docker build -t komelia-build-android - < ./cmake/android.Dockerfile
+          fi
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp \
+            -e GIT_AUTHOR_NAME=build -e GIT_AUTHOR_EMAIL=build@localhost \
+            -e GIT_COMMITTER_NAME=build -e GIT_COMMITTER_EMAIL=build@localhost \
+            -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0='*' \
+            -v "$PWD":/build komelia-build-android "$ARCH"
+          ls -la "cmake/build-android-$ARCH/sysroot/lib" | grep '\.so' | head -60
+          df -h /
+
+      # Saved right away (not at the end of the job), so a later failure
+      # doesn't throw away the 1-2 hour native build.
+      - name: Save native libraries to cache
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: komelia/cmake/build-android-${{ inputs.arch }}/sysroot/lib
+          key: ${{ steps.native.outputs.key }}
+
+      - name: Set up Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Accept Android SDK licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Build APK
+        working-directory: komelia
+        run: |
+          ./gradlew --no-daemon --stacktrace "android-${ARCH}_copyJniLibs"
+          ./gradlew --no-daemon --stacktrace buildEpubReaders
+          ./gradlew --no-daemon --stacktrace :androidRelease
+
+      - name: Sign APK
+        run: |
+          BT="$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)"
+          APK_IN=$(ls komelia/komelia-app/androidApp/build/outputs/apk/release/*.apk | head -1)
+          echo "Signing $APK_IN"
+          OUT="Komelia-Swipe-${{ inputs.komelia_ref }}-${ARCH}.apk"
+          "$BT/zipalign" -f -p 4 "$APK_IN" aligned.apk
+          "$BT/apksigner" sign --ks kit/signing/komelia-swipe.jks --ks-pass "pass:$KEY_PASS" \
+            --ks-key-alias komelia-swipe --out "$OUT" aligned.apk
+          "$BT/apksigner" verify "$OUT"
+          echo "APK=$OUT" >> "$GITHUB_ENV"
+
+      - name: Upload APK (backup copy)
+        uses: actions/upload-artifact@v7
+        with:
+          name: komelia-swipe-apk
+          path: ${{ env.APK }}
+          retention-days: 14
+
+      - name: Publish APK as a release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "build-${{ github.run_number }}" "$APK" \
+            --repo "${{ github.repository }}" \
+            --title "Komelia Swipe ${{ inputs.komelia_ref }} (build ${{ github.run_number }})" \
+            --notes "Komelia ${{ inputs.komelia_ref }} with swipe navigation, ${ARCH} build."
