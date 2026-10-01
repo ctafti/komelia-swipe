@@ -57,10 +57,10 @@ index 91df128c..f89589a3 100644
  
 diff --git a/komelia-app/androidApp/src/main/kotlin/snd/komelia/PointerInputRootLayout.kt b/komelia-app/androidApp/src/main/kotlin/snd/komelia/PointerInputRootLayout.kt
 new file mode 100644
-index 00000000..695d240f
+index 00000000..ebc31ad8
 --- /dev/null
 +++ b/komelia-app/androidApp/src/main/kotlin/snd/komelia/PointerInputRootLayout.kt
-@@ -0,0 +1,145 @@
+@@ -0,0 +1,155 @@
 +package snd.komelia
 +
 +import android.content.Context
@@ -114,12 +114,21 @@ index 00000000..695d240f
 +    private fun updatePointerCapture() {
 +        val requested = CapturedPointerInput.isActive.value
 +        if (requested && hasWindowFocus() && !hasPointerCapture()) {
-+            // Captured events are dispatched along the focused view chain
-+            if (findFocus() == null) requestFocus()
++            // Captured events are dispatched along the focused view chain, so some view must have focus.
++            // Children are tried first; this layout only takes focus if none of them can.
++            if (findFocus() == null) {
++                isFocusableInTouchMode = true
++                requestFocus()
++            }
 +            requestPointerCapture()
 +        } else if (!requested && hasPointerCapture()) {
 +            releasePointerCapture()
 +        }
++    }
++
++    override fun onPointerCaptureChange(hasCapture: Boolean) {
++        super.onPointerCaptureChange(hasCapture)
++        CapturedPointerInput.onCaptureChanged(hasCapture)
 +    }
 +
 +    override fun dispatchCapturedPointerEvent(event: MotionEvent): Boolean {
@@ -188,7 +197,8 @@ index 00000000..695d240f
 +                }
 +            }
 +
-+            MotionEvent.ACTION_CANCEL -> pressed = false
++            // A press is a single pointer; anything more is not a remote button
++            MotionEvent.ACTION_POINTER_DOWN, MotionEvent.ACTION_CANCEL -> pressed = false
 +        }
 +    }
 +
@@ -704,6 +714,20 @@ index 45bf986d..037911ac 100644
      override val primaryKey = PrimaryKey(bookId)
  }
 \ No newline at end of file
+diff --git a/komelia-ui/src/androidMain/kotlin/snd/komelia/ui/platform/CursorDevice.android.kt b/komelia-ui/src/androidMain/kotlin/snd/komelia/ui/platform/CursorDevice.android.kt
+new file mode 100644
+index 00000000..1aa271f1
+--- /dev/null
++++ b/komelia-ui/src/androidMain/kotlin/snd/komelia/ui/platform/CursorDevice.android.kt
+@@ -0,0 +1,8 @@
++package snd.komelia.ui.platform
++
++import android.view.InputDevice
++import androidx.compose.ui.input.pointer.PointerEvent
++
++actual fun PointerEvent.isFromCursorDevice(): Boolean {
++    return motionEvent?.isFromSource(InputDevice.SOURCE_MOUSE) ?: false
++}
 diff --git a/komelia-ui/src/commonMain/composeResources/values/strings.xml b/komelia-ui/src/commonMain/composeResources/values/strings.xml
 index 33059271..638fc8e8 100644
 --- a/komelia-ui/src/commonMain/composeResources/values/strings.xml
@@ -773,10 +797,10 @@ index 5f765966..e0e76b3c 100644
  
 diff --git a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/platform/CapturedPointerInput.kt b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/platform/CapturedPointerInput.kt
 new file mode 100644
-index 00000000..1d66b8ec
+index 00000000..75377cf9
 --- /dev/null
 +++ b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/platform/CapturedPointerInput.kt
-@@ -0,0 +1,60 @@
+@@ -0,0 +1,73 @@
 +package snd.komelia.ui.platform
 +
 +import androidx.compose.runtime.Composable
@@ -807,12 +831,25 @@ index 00000000..1d66b8ec
 +    private val listeners = mutableListOf<(CapturedPointerGesture) -> Unit>()
 +    private val mutableIsActive = MutableStateFlow(false)
 +
++    private val mutableIsCaptured = MutableStateFlow(false)
++
 +    /** True while any screen listens. The platform keeps pointer capture on while this is true. */
 +    val isActive: StateFlow<Boolean> = mutableIsActive.asStateFlow()
++
++    /**
++     * True while the platform actually has pointer capture. Capture can be refused or lost (e.g. when
++     * another window takes focus), in which case devices keep moving their cursor as usual.
++     */
++    val isCaptured: StateFlow<Boolean> = mutableIsCaptured.asStateFlow()
 +
 +    /** Called by the platform for each completed press. Only the most recent listener receives it. */
 +    fun dispatch(gesture: CapturedPointerGesture) {
 +        listeners.lastOrNull()?.invoke(gesture)
++    }
++
++    /** Called by the platform when pointer capture is granted or lost. */
++    fun onCaptureChanged(captured: Boolean) {
++        mutableIsCaptured.value = captured
 +    }
 +
 +    internal fun addListener(listener: (CapturedPointerGesture) -> Unit) {
@@ -837,6 +874,22 @@ index 00000000..1d66b8ec
 +        onDispose { CapturedPointerInput.removeListener(listener) }
 +    }
 +}
+diff --git a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/platform/CursorDevice.kt b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/platform/CursorDevice.kt
+new file mode 100644
+index 00000000..d760605c
+--- /dev/null
++++ b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/platform/CursorDevice.kt
+@@ -0,0 +1,10 @@
++package snd.komelia.ui.platform
++
++import androidx.compose.ui.input.pointer.PointerEvent
++
++/**
++ * True if this event came from a device that moves a cursor (a mouse, or a touchpad-like device such
++ * as a Bluetooth page-turner remote) rather than the touchscreen. Pointer types alone can't tell:
++ * Android reports touchpad input as finger input.
++ */
++expect fun PointerEvent.isFromCursorDevice(): Boolean
 diff --git a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/platform/PointerVisibility.kt b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/platform/PointerVisibility.kt
 new file mode 100644
 index 00000000..39fb7452
@@ -1225,10 +1278,10 @@ index a18d6099..35236b33 100644
  
 diff --git a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/image/common/ReaderSwipeGestures.kt b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/image/common/ReaderSwipeGestures.kt
 new file mode 100644
-index 00000000..4ddf83c7
+index 00000000..e579728c
 --- /dev/null
 +++ b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/image/common/ReaderSwipeGestures.kt
-@@ -0,0 +1,221 @@
+@@ -0,0 +1,236 @@
 +package snd.komelia.ui.reader.image.common
 +
 +import androidx.compose.foundation.gestures.awaitEachGesture
@@ -1249,6 +1302,7 @@ index 00000000..4ddf83c7
 +import snd.komelia.settings.model.ReaderSwipeActions
 +import snd.komelia.settings.model.ReaderSwipeDirection
 +import snd.komelia.ui.platform.CapturedPointerEffect
++import snd.komelia.ui.platform.isFromCursorDevice
 +import snd.komelia.ui.reader.image.ScreenScaleState
 +import kotlin.math.abs
 +
@@ -1311,13 +1365,14 @@ index 00000000..4ddf83c7
 +
 +        awaitEachGesture {
 +            val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
++            val pointerType = pointerTypeOf(down)
 +            val actions = currentSwipeActions
 +            // Finger input is never reserved
-+            val reserved = actions.learnedRemoteButtons.any {
-+                it.action != ReaderSwipeAction.NONE && !it.isTouch && it.pointerType == down.type.toString()
++            val reserved = pointerType != TOUCH_POINTER_TYPE && actions.learnedRemoteButtons.any {
++                it.action != ReaderSwipeAction.NONE && it.pointerType == pointerType
 +            }
 +            val startTransform = screenScaleState?.transformation?.value
-+            val gesture = trackGesture(down, reserve = reserved) ?: return@awaitEachGesture
++            val gesture = trackGesture(down, pointerType, reserve = reserved) ?: return@awaitEachGesture
 +
 +            if (actions.remoteButtonsEnabled) {
 +                val button = actions.learnedRemoteButtons.findMatch(toRemoteButtonInput(gesture))
@@ -1363,7 +1418,7 @@ index 00000000..4ddf83c7
 +    Modifier.pointerInput(Unit) {
 +        awaitEachGesture {
 +            val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
-+            val gesture = trackGesture(down, reserve = true) ?: return@awaitEachGesture
++            val gesture = trackGesture(down, pointerTypeOf(down), reserve = true) ?: return@awaitEachGesture
 +            currentOnInput(toRemoteButtonInput(gesture))
 +        }
 +    }
@@ -1388,8 +1443,17 @@ index 00000000..4ddf83c7
 +    }
 +}
 +
++/**
++ * Pointer type of the gesture that [down] starts: Compose's pointer type, or [CURSOR_POINTER_TYPE] for
++ * devices that move a cursor. Must be called right after the down event.
++ */
++private fun AwaitPointerEventScope.pointerTypeOf(down: PointerInputChange): String {
++    return if (currentEvent.isFromCursorDevice()) CURSOR_POINTER_TYPE else down.type.toString()
++}
++
 +private class TrackedGesture(
 +    val down: PointerInputChange,
++    val pointerType: String,
 +    val endPosition: Offset,
 +    val durationMillis: Long,
 +    private val upEvent: PointerEvent,
@@ -1402,7 +1466,11 @@ index 00000000..4ddf83c7
 + * Follows a gesture from [down] until all pointers are up. Returns null for multi-touch gestures.
 + * With [reserve], every event is consumed so nothing else handles the gesture.
 + */
-+private suspend fun AwaitPointerEventScope.trackGesture(down: PointerInputChange, reserve: Boolean): TrackedGesture? {
++private suspend fun AwaitPointerEventScope.trackGesture(
++    down: PointerInputChange,
++    pointerType: String,
++    reserve: Boolean,
++): TrackedGesture? {
 +    if (reserve) down.consume()
 +    var endPosition = down.position
 +    var endTime = down.uptimeMillis
@@ -1419,7 +1487,7 @@ index 00000000..4ddf83c7
 +        }
 +        if (event.changes.none { it.pressed }) {
 +            return if (multiTouch) null
-+            else TrackedGesture(down, endPosition, endTime - down.uptimeMillis, event)
++            else TrackedGesture(down, pointerType, endPosition, endTime - down.uptimeMillis, event)
 +        }
 +    }
 +}
@@ -1439,7 +1507,7 @@ index 00000000..4ddf83c7
 +    }
 +    return RemoteButtonInput(
 +        button = LearnedRemoteButton(
-+            pointerType = gesture.down.type.toString(),
++            pointerType = gesture.pointerType,
 +            deltaX = delta.x.toDp().value,
 +            deltaY = delta.y.toDp().value,
 +            landscape = width > height,
@@ -1452,10 +1520,10 @@ index 00000000..4ddf83c7
 +}
 diff --git a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/image/common/RemoteButtons.kt b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/image/common/RemoteButtons.kt
 new file mode 100644
-index 00000000..a106f25a
+index 00000000..121a875a
 --- /dev/null
 +++ b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/image/common/RemoteButtons.kt
-@@ -0,0 +1,147 @@
+@@ -0,0 +1,150 @@
 +package snd.komelia.ui.reader.image.common
 +
 +import snd.komelia.settings.model.LearnedRemoteButton
@@ -1472,6 +1540,9 @@ index 00000000..a106f25a
 +
 +/** Compose name of finger input. */
 +const val TOUCH_POINTER_TYPE = "Touch"
++
++/** Pointer type of screen input from a device that moves a cursor (see isFromCursorDevice). */
++const val CURSOR_POINTER_TYPE = "Cursor"
 +
 +/** Movement shorter than this is a tap (dp for screen input, device units for captured input). */
 +private const val TAP_THRESHOLD = 16f
@@ -1504,7 +1575,7 @@ index 00000000..a106f25a
 +    val endEdges: Set<ReaderSwipeDirection>,
 +)
 +
-+/** True if this input came from a finger (or a remote that acts exactly like one). */
++/** True if this input came from a finger on the touchscreen (or a remote that acts exactly like one). */
 +val LearnedRemoteButton.isTouch: Boolean
 +    get() = pointerType == TOUCH_POINTER_TYPE
 +
@@ -2278,10 +2349,10 @@ index 00000000..fea229de
 +}
 diff --git a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/settings/imagereader/RemoteButtonLearningPage.kt b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/settings/imagereader/RemoteButtonLearningPage.kt
 new file mode 100644
-index 00000000..4882d267
+index 00000000..c4227698
 --- /dev/null
 +++ b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/settings/imagereader/RemoteButtonLearningPage.kt
-@@ -0,0 +1,196 @@
+@@ -0,0 +1,201 @@
 +package snd.komelia.ui.settings.imagereader
 +
 +import androidx.compose.foundation.background
@@ -2299,6 +2370,7 @@ index 00000000..4882d267
 +import androidx.compose.material3.Text
 +import androidx.compose.material3.TextButton
 +import androidx.compose.runtime.Composable
++import androidx.compose.runtime.collectAsState
 +import androidx.compose.runtime.getValue
 +import androidx.compose.runtime.mutableStateOf
 +import androidx.compose.runtime.remember
@@ -2332,6 +2404,7 @@ index 00000000..4882d267
 +import snd.komelia.ui.platform.BackPressHandler
 +import snd.komelia.ui.platform.CapturedPointerEffect
 +import snd.komelia.ui.platform.CapturedPointerGesture
++import snd.komelia.ui.platform.CapturedPointerInput
 +import snd.komelia.ui.reader.image.common.RemoteButtonInput
 +import snd.komelia.ui.reader.image.common.isTouch
 +import snd.komelia.ui.reader.image.common.kind
@@ -2358,9 +2431,12 @@ index 00000000..4882d267
 +    if (step == RemoteButtonLearningStep.Idle) return
 +    var captureAvailable by remember { mutableStateOf(true) }
 +    val waiting = step as? RemoteButtonLearningStep.WaitingForPress
-+    val capturing = captureAvailable && waiting != null && waiting.firstPress == null
++    val requestCapture = captureAvailable && waiting != null && waiting.firstPress == null
++    CapturedPointerEffect(enabled = requestCapture, onGesture = onCapturedInput)
 +
-+    CapturedPointerEffect(enabled = capturing, onGesture = onCapturedInput)
++    // Capture can be refused; the remote then keeps moving its cursor and is learned from screen input
++    val captureGranted = CapturedPointerInput.isCaptured.collectAsState().value
++    val capturing = requestCapture && captureGranted
 +    BackPressHandler(onCancel)
 +
 +    Popup(
@@ -2478,3 +2554,25 @@ index 00000000..4882d267
 +private fun LearningTitle(text: String) {
 +    Text(text, style = MaterialTheme.typography.headlineSmall, textAlign = TextAlign.Center)
 +}
+diff --git a/komelia-ui/src/jvmMain/kotlin/snd/komelia/ui/platform/CursorDevice.jvm.kt b/komelia-ui/src/jvmMain/kotlin/snd/komelia/ui/platform/CursorDevice.jvm.kt
+new file mode 100644
+index 00000000..98d18c81
+--- /dev/null
++++ b/komelia-ui/src/jvmMain/kotlin/snd/komelia/ui/platform/CursorDevice.jvm.kt
+@@ -0,0 +1,5 @@
++package snd.komelia.ui.platform
++
++import androidx.compose.ui.input.pointer.PointerEvent
++
++actual fun PointerEvent.isFromCursorDevice(): Boolean = false
+diff --git a/komelia-ui/src/wasmJsMain/kotlin/snd/komelia/ui/platform/CursorDevice.wasmJs.kt b/komelia-ui/src/wasmJsMain/kotlin/snd/komelia/ui/platform/CursorDevice.wasmJs.kt
+new file mode 100644
+index 00000000..98d18c81
+--- /dev/null
++++ b/komelia-ui/src/wasmJsMain/kotlin/snd/komelia/ui/platform/CursorDevice.wasmJs.kt
+@@ -0,0 +1,5 @@
++package snd.komelia.ui.platform
++
++import androidx.compose.ui.input.pointer.PointerEvent
++
++actual fun PointerEvent.isFromCursorDevice(): Boolean = false
