@@ -38,6 +38,8 @@ jobs:
         uses: actions/checkout@v7
         with:
           path: kit
+          # Always the latest patch and key, also when re-running an older run
+          ref: ${{ github.event.repository.default_branch }}
 
       - name: Create signing key (first run only)
         working-directory: kit
@@ -167,7 +169,49 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "build-${{ github.run_number }}" "$APK" \
+          gh release create "build-${{ github.run_number }}-${{ github.run_attempt }}" "$APK" \
             --repo "${{ github.repository }}" \
             --title "Komelia Swipe ${{ inputs.komelia_ref }} (build ${{ github.run_number }})" \
             --notes "Komelia ${{ inputs.komelia_ref }} with swipe navigation, ${ARCH} build."
+
+  # Runs in parallel with the APK build: checks that the patched code also compiles for the
+  # desktop and web versions of Komelia (needed before submitting the change upstream).
+  check-desktop-and-web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Check out this repository (patch)
+        uses: actions/checkout@v7
+        with:
+          path: kit
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Check out Komelia ${{ inputs.komelia_ref }}
+        uses: actions/checkout@v7
+        with:
+          repository: Snd-R/Komelia
+          ref: ${{ inputs.komelia_ref }}
+          path: komelia
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Apply swipe navigation patch
+        working-directory: komelia
+        run: git apply --verbose ../kit/swipe-navigation.patch
+
+      - name: Set up Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Accept Android SDK licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Compile desktop (JVM) and web (Wasm) code
+        working-directory: komelia
+        run: ./gradlew --no-daemon --continue compileKotlinJvm compileKotlinWasmJs
+
