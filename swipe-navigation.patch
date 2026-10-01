@@ -733,7 +733,7 @@ index 00000000..7d5d1b54
 +
 +actual fun Modifier.excludeFromSystemGestures(): Modifier = systemGestureExclusion()
 diff --git a/komelia-ui/src/commonMain/composeResources/values/strings.xml b/komelia-ui/src/commonMain/composeResources/values/strings.xml
-index 33059271..7a4f191a 100644
+index 33059271..82d79421 100644
 --- a/komelia-ui/src/commonMain/composeResources/values/strings.xml
 +++ b/komelia-ui/src/commonMain/composeResources/values/strings.xml
 @@ -580,6 +580,54 @@
@@ -778,7 +778,7 @@ index 33059271..7a4f191a 100644
 +    <string name="settings_image_remote_learn_method_direct">Direct</string>
 +    <string name="settings_image_remote_learn_direct_body">Press the button once. The remote is read directly, without its cursor. If nothing happens, your remote doesn't support this method, so use Screen instead.</string>
 +    <string name="settings_image_remote_learn_direct_unavailable">Direct reading isn't available right now. Use Screen instead.</string>
-+    <string name="settings_image_remote_learn_box_body">Move the remote's cursor into the box, then press the button you want to use. Presses that start outside the box are ignored, so you can use other buttons to move the cursor.</string>
++    <string name="settings_image_remote_learn_box_body">Move the remote's cursor (the dot) into the box, then press the button you want to use. Presses that start outside the box only move the cursor, so you can use your other buttons to bring it there.</string>
 +    <string name="settings_image_remote_learn_rotate_landscape">Rotate to landscape, then press the same button again</string>
 +    <string name="settings_image_remote_learn_rotate_portrait">Rotate to portrait, then press the same button again</string>
 +    <string name="settings_image_remote_learn_problem_edge">That press started too close to the edge of the screen. Move the cursor into the box and try again.</string>
@@ -1624,10 +1624,10 @@ index 00000000..9407bae7
 +}
 diff --git a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/image/common/RemoteButtons.kt b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/image/common/RemoteButtons.kt
 new file mode 100644
-index 00000000..bbb6074d
+index 00000000..0f8d7078
 --- /dev/null
 +++ b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/reader/image/common/RemoteButtons.kt
-@@ -0,0 +1,203 @@
+@@ -0,0 +1,206 @@
 +package snd.komelia.ui.reader.image.common
 +
 +import snd.komelia.settings.model.LearnedRemoteButton
@@ -1664,8 +1664,11 @@ index 00000000..bbb6074d
 +/** A perfectly straight input matches a straight button once it has moved this far (dp). */
 +private const val STRAIGHT_MATCH_DISTANCE = 12f
 +
-+/** While learning from screen input, a swipe must start in this middle part of the screen along its direction. */
-+private val LEARNING_START_ZONE = 0.25f..0.75f
++/**
++ * While learning from screen input, a swipe must start in this middle part of the screen along its
++ * direction (as a fraction of the screen's width or height).
++ */
++val REMOTE_BUTTON_LEARNING_ZONE = 0.25f..0.75f
 +
 +/** Kind of input a remote button sends. */
 +enum class RemoteButtonKind { TAP, SWIPE_LEFT, SWIPE_RIGHT, SWIPE_UP, SWIPE_DOWN }
@@ -1725,8 +1728,8 @@ index 00000000..bbb6074d
 +        if (endEdges.isNotEmpty() && (kind == RemoteButtonKind.TAP || kind.edge() in endEdges)) return false
 +        return when (kind) {
 +            RemoteButtonKind.TAP -> true
-+            RemoteButtonKind.SWIPE_UP, RemoteButtonKind.SWIPE_DOWN -> startFractionY in LEARNING_START_ZONE
-+            RemoteButtonKind.SWIPE_LEFT, RemoteButtonKind.SWIPE_RIGHT -> startFractionX in LEARNING_START_ZONE
++            RemoteButtonKind.SWIPE_UP, RemoteButtonKind.SWIPE_DOWN -> startFractionY in REMOTE_BUTTON_LEARNING_ZONE
++            RemoteButtonKind.SWIPE_LEFT, RemoteButtonKind.SWIPE_RIGHT -> startFractionX in REMOTE_BUTTON_LEARNING_ZONE
 +        }
 +    }
 +
@@ -2588,21 +2591,25 @@ index 00000000..1ca58d56
 +}
 diff --git a/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/settings/imagereader/RemoteButtonLearningPage.kt b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/settings/imagereader/RemoteButtonLearningPage.kt
 new file mode 100644
-index 00000000..dbbe0e34
+index 00000000..966b4a28
 --- /dev/null
 +++ b/komelia-ui/src/commonMain/kotlin/snd/komelia/ui/settings/imagereader/RemoteButtonLearningPage.kt
-@@ -0,0 +1,223 @@
+@@ -0,0 +1,267 @@
 +package snd.komelia.ui.settings.imagereader
 +
 +import androidx.compose.foundation.background
 +import androidx.compose.foundation.border
 +import androidx.compose.foundation.layout.Arrangement
 +import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.BoxWithConstraints
 +import androidx.compose.foundation.layout.Column
 +import androidx.compose.foundation.layout.Row
 +import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.offset
 +import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
 +import androidx.compose.foundation.layout.widthIn
++import androidx.compose.foundation.shape.CircleShape
 +import androidx.compose.foundation.shape.RoundedCornerShape
 +import androidx.compose.material3.FilledTonalButton
 +import androidx.compose.material3.FilterChip
@@ -2617,6 +2624,8 @@ index 00000000..dbbe0e34
 +import androidx.compose.runtime.setValue
 +import androidx.compose.ui.Alignment
 +import androidx.compose.ui.Modifier
++import androidx.compose.ui.geometry.Offset
++import androidx.compose.ui.graphics.Color
 +import androidx.compose.ui.text.style.TextAlign
 +import androidx.compose.ui.unit.IntOffset
 +import androidx.compose.ui.unit.IntRect
@@ -2647,9 +2656,13 @@ index 00000000..dbbe0e34
 +import snd.komelia.ui.platform.CapturedPointerEffect
 +import snd.komelia.ui.platform.CapturedPointerGesture
 +import snd.komelia.ui.platform.CapturedPointerInput
++import snd.komelia.ui.reader.image.common.REMOTE_BUTTON_LEARNING_ZONE
 +import snd.komelia.ui.reader.image.common.RemoteButtonInput
 +import snd.komelia.ui.reader.image.common.kind
++import snd.komelia.ui.reader.image.common.rememberRemoteCursorState
 +import snd.komelia.ui.reader.image.common.remoteButtonLearningInput
++import snd.komelia.ui.reader.image.common.trackRemoteCursor
++import kotlin.math.roundToInt
 +
 +/** How a remote button is learned and later recognized. */
 +private enum class LearningMethod {
@@ -2687,24 +2700,41 @@ index 00000000..dbbe0e34
 +    val captured = CapturedPointerInput.isCaptured.collectAsState().value
 +    BackPressHandler(onCancel)
 +
++    // Android often hides the remote's cursor (e.g. after the screen is touched), so the page shows its own
++    val cursor = rememberRemoteCursorState()
++    val screenInput = waiting != null && !direct
++
 +    Popup(
 +        popupPositionProvider = FullScreenPopupPositionProvider,
 +        properties = PopupProperties(focusable = false),
 +    ) {
 +        Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surface)) {
 +            // Screen input area. The buttons around it are drawn on top, so tapping them isn't recorded.
-+            Box(
++            BoxWithConstraints(
 +                modifier = Modifier
 +                    .fillMaxSize()
-+                    .remoteButtonLearningInput(enabled = waiting != null && !direct, onInput = onInput),
++                    .trackRemoteCursor(cursor, enabled = screenInput)
++                    .remoteButtonLearningInput(enabled = screenInput, onInput = onInput),
 +            ) {
-+                if (waiting != null && !direct) {
++                if (screenInput) {
++                    val position = cursor.position
++                    val width = constraints.maxWidth.toFloat()
++                    val height = constraints.maxHeight.toFloat()
++                    val cursorInBox = position != null &&
++                            position.x / width in REMOTE_BUTTON_LEARNING_ZONE &&
++                            position.y / height in REMOTE_BUTTON_LEARNING_ZONE
 +                    Box(
 +                        Modifier
 +                            .align(Alignment.Center)
-+                            .fillMaxSize(0.5f)
++                            .fillMaxSize(REMOTE_BUTTON_LEARNING_ZONE.endInclusive - REMOTE_BUTTON_LEARNING_ZONE.start)
++                            .background(
++                                if (cursorInBox) MaterialTheme.colorScheme.primary.copy(alpha = 0.15f)
++                                else Color.Transparent,
++                                RoundedCornerShape(12.dp),
++                            )
 +                            .border(2.dp, MaterialTheme.colorScheme.primary, RoundedCornerShape(12.dp))
 +                    )
++                    if (position != null) CursorDot(position)
 +                }
 +                Column(
 +                    modifier = Modifier.align(Alignment.Center).padding(32.dp).widthIn(max = 480.dp),
@@ -2773,6 +2803,23 @@ index 00000000..dbbe0e34
 +            }
 +        }
 +    }
++}
++
++private val CURSOR_DOT_SIZE = 20.dp
++
++/** Marks where the remote's cursor is. */
++@Composable
++private fun CursorDot(position: Offset) {
++    Box(
++        Modifier
++            .offset {
++                val radius = CURSOR_DOT_SIZE.toPx() / 2
++                IntOffset((position.x - radius).roundToInt(), (position.y - radius).roundToInt())
++            }
++            .size(CURSOR_DOT_SIZE)
++            .background(MaterialTheme.colorScheme.primary, CircleShape)
++            .border(2.dp, MaterialTheme.colorScheme.onPrimary, CircleShape)
++    )
 +}
 +
 +private object FullScreenPopupPositionProvider : PopupPositionProvider {
